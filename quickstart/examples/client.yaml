@@ -1,0 +1,15 @@
+server: YOUR_IP_OR_DOMAIN:443
+auth: secret
+
+tls:
+  sni: YOUR_IP_OR_DOMAIN
+  # 自签证书：保留 insecure。正式证书请删掉 insecure，必要时改用 ca。
+  insecure: true
+  # ca: /path/to/ca.pem
+
+socks5:
+  listen: 127.0.0.1:1080
+
+# 可选：本机 HTTP 代理（浏览器 CONNECT）
+http:
+  listen: 127.0.0.1:8080

@@ -1,0 +1,53 @@
+# listen: :443
+
+tls:
+  cert: /etc/hy/server.crt
+  key: /etc/hy/server.key
+
+auth:
+  type: password
+  password: secret
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://news.163.com/
+    rewriteHost: true
+
+#bandwidth:
+#  up: 50 mbps
+#  down: 20 mbps
+
+ignoreClientBandwidth: true
+
+disableUDP: false
+
+udpIdleTimeout: 60s
+
+acl:
+  inline:
+    - reject(geoip:cn)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+
+resolver:
+  type: tls
+  udp:
+    addr: 8.8.4.4:53
+    timeout: 4s
+  tls:
+    addr: 1.1.1.1:853
+    timeout: 10s
+    sni: cloudflare-dns.com
+    insecure: false
+
+outbounds:
+  - name: v4_only
+    type: direct
+    direct:
+      mode: 4
+  - name: v6_only
+    type: direct
+    direct:
+      mode: 6

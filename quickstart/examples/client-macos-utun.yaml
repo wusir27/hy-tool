@@ -1,0 +1,26 @@
+server: YOUR_IP_OR_DOMAIN:443
+auth: secret
+
+tls:
+  sni: YOUR_IP_OR_DOMAIN
+  insecure: true
+  # ca: /path/to/ca.pem
+
+socks5:
+  listen: 127.0.0.1:1080
+
+# 系统级隧道。name 必须是 utun + 数字，不能写成 hy0。
+# 配地址和加路由需要 sudo。
+tun:
+  name: utun123
+  mtu: 1500
+  timeout: 5m
+  address:
+    ipv4: 100.100.100.101/30
+    ipv6: "2001::ffff:ffff:ffff:fff1/126"
+  route:
+    # 写了 route: 但没写 ipv4：拆开的默认路由（和官方 macOS 客户端一样）。
+    # 不写 route: 则只建网卡、不加路由。
+    # 真正的默认路由请显式写 ipv4: [0.0.0.0/0]，并务必排除服务器公网 IP。
+    ipv4Exclude:
+      - YOUR_SERVER_PUBLIC_IP/32
