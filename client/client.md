@@ -12,7 +12,7 @@
    curl -fL -o hy https://github.com/wusir27/hy/releases/download/v0.0.1/hy-linux-amd64
    ```
 
-   > 服务端须已按 [server.md](server.md) 跑起来。完整字段见 [USAGE.md](https://github.com/wusir27/hy/blob/main/USAGE.md)。
+   > 服务端须已按 [server.md](../server/server.md) 跑起来。完整字段见 [USAGE.md](https://github.com/wusir27/hy/blob/main/USAGE.md)。
    >
    > 本仓库**没有** Windows 安装包；v0.0.1 也未发布 Windows 二进制。
 

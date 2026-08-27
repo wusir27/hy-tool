@@ -3,7 +3,7 @@
 1. 用 **root** 在 Linux + systemd 上跑安装脚本：
 
    ```bash
-   bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/install/install_server.sh)
+   bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/server/install_server.sh)
    ```
 
    > 前提：云安全组 / 本机防火墙将放行 **UDP 443**（QUIC，不是 TCP 443）；一个域名或公网 IP 给客户端填 `server:`；自签需要 `openssl`。
@@ -19,7 +19,7 @@
    > | 单元 | `hy-server.service`（另有 `hy-server@.service`） |
    > | 运行用户 / 家目录 | `hy` / `/var/lib/hy` |
    >
-   > 本机可以同时装着官方 Hysteria。hy **不会**写 `/etc/hysteria`。详情与环境变量见 [install/README.md](../install/README.md)。
+   > 本机可以同时装着官方 Hysteria。hy **不会**写 `/etc/hysteria`。详情与环境变量见 [install.md](install.md)。
    >
    > 脚本**不会** `enable` / `start`。先改配置和证书，再手动开。安装脚本自带的示例是 ACME 占位；本指南改用手写证书（`tls.cert` / `tls.key`），下一步把 `/etc/hy/server.yaml` 整份换成 [examples/server.yaml](examples/server.yaml)。
 
@@ -40,7 +40,7 @@
 3. 写入配置并改密码：
 
    ```bash
-   cp /path/to/hy-tool/quickstart/examples/server.yaml /etc/hy/server.yaml
+   cp /path/to/hy-tool/server/examples/server.yaml /etc/hy/server.yaml
    ```
 
    编辑 `/etc/hy/server.yaml`：把 `auth.password` 从 `secret` 改成你自己的密码（客户端 `auth` 必须相同）。内容以该示例为准。
@@ -102,4 +102,4 @@
 
    > `hy version` 应为 `0.0.1`。日志里若在拉 `geoip.dat`，等下载完成；失败会直接退出。
    >
-   > 下一步：[client.md](client.md)。客户端 `auth` 填同一密码，`server` 填 `域名或IP:443`。
+   > 下一步：[client.md](../client/client.md)。客户端 `auth` 填同一密码，`server` 填 `域名或IP:443`。

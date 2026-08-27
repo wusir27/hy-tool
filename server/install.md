@@ -1,9 +1,3 @@
-主文档已搬到 [../server/](../server/)。本页保留以免旧链 404。
-
-新脚本：https://raw.githubusercontent.com/wusir27/hy-tool/main/server/install_server.sh
-
-旧 raw URL 仍可用（本目录脚本是兼容层）。
-
 # hy Linux server install
 
 Install, upgrade, or remove the [hy](https://github.com/wusir27/hy) server on Linux + systemd.
@@ -11,13 +5,13 @@ Install, upgrade, or remove the [hy](https://github.com/wusir27/hy) server on Li
 There is **no** short domain. This script does **not** occupy or imitate `get.hy2.sh`.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/install/install_server.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/server/install_server.sh)
 ```
 
 If GitHub has no published Release yet, download will fail. Use a local gnu binary instead:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/install/install_server.sh) --local /path/to/hy-linux-amd64
+bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/server/install_server.sh) --local /path/to/hy-linux-amd64
 ```
 
 ## Flags
