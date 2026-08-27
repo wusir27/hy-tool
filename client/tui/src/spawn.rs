@@ -1,6 +1,6 @@
-//! Build `hy client` argv for Start (U3). No sudo, no SIGINT Stop, no exec in the UI.
+//! Build `hy client` argv for Start (U3) and hand it to the sudo wrapper (U4).
 //!
-//! Command: `<hy_bin> client -c <abs client.yaml> [--route <abs route>]`
+//! Inner command: `<hy_bin> client -c <abs client.yaml> [--route <abs route>]`
 //! Absolute paths only. Route mode off omits `--route`.
 
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use crate::config_gen::{FormState, RouteMode};
 use crate::fetch_hy;
 use crate::fetch_route::{self, FetchResult};
 
-/// Prepared Start: argv to show (and later exec in U4) plus optional RULE-SET warning.
+/// Prepared Start: inner `hy client` argv (wrapped with sudo in U4) plus optional RULE-SET warning.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PreparedStart {

@@ -303,6 +303,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
@@ -310,6 +311,7 @@ dependencies = [
  "sha2",
  "tokio",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]

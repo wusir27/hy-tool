@@ -3,15 +3,17 @@
 use crate::config_gen::{FormState, RouteMode};
 use crate::fetch_route;
 use crate::spawn;
+use crate::sudo::{self, PASSWORD_PROMPT};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const STATUS_HINT: &str =
-    "U3: Save writes yaml; Start shows argv (--route if url/local); Update hy installs ~/.hy/bin/hy";
+    "U4: Start launches hy via sudo; Stop = SIGINT. Save / Update hy unchanged";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -54,6 +56,8 @@ pub enum Focus {
     Save,
     Start,
     UpdateHy,
+    Stop,
+    Restart,
 }
 
 impl Focus {
@@ -130,6 +134,10 @@ fn focus_order(form: &FormState) -> Vec<Focus> {
     v
 }
 
+fn run_focus_order() -> [Focus; 2] {
+    [Focus::Stop, Focus::Restart]
+}
+
 fn next_focus(form: &FormState, cur: Focus) -> Focus {
     let order = focus_order(form);
     match order.iter().position(|f| *f == cur) {
@@ -153,6 +161,61 @@ pub enum Action {
     Save,
     Start,
     UpdateHy,
+    Stop,
+    Restart,
+    PasswordSubmit,
+    PasswordCancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPhase {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Error,
+}
+
+impl RunPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stopped => "STOPPED",
+            Self::Starting => "STARTING",
+            Self::Running => "RUNNING",
+            Self::Stopping => "STOPPING",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+pub struct PasswordPrompt {
+    buf: Zeroizing<String>,
+    pub failures: u8,
+}
+
+impl PasswordPrompt {
+    pub fn new(failures: u8) -> Self {
+        Self {
+            buf: Zeroizing::new(String::new()),
+            failures,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.chars().count()
+    }
+
+    pub fn take_buf(mut self) -> Zeroizing<String> {
+        let mut empty = Zeroizing::new(String::new());
+        std::mem::swap(&mut self.buf, &mut empty);
+        empty
+    }
+}
+
+impl Drop for PasswordPrompt {
+    fn drop(&mut self) {
+        Zeroize::zeroize(&mut *self.buf);
+    }
 }
 
 pub struct App {
@@ -164,6 +227,9 @@ pub struct App {
     pub status_warn: bool,
     pub cursor: usize,
     scroll: u16,
+    pub run_phase: RunPhase,
+    pub hy_pid: Option<u32>,
+    pub password_prompt: Option<PasswordPrompt>,
 }
 
 impl App {
@@ -177,9 +243,21 @@ impl App {
             status_warn: false,
             cursor: 0,
             scroll: 0,
+            run_phase: RunPhase::Stopped,
+            hy_pid: None,
+            password_prompt: None,
         };
         app.sync_cursor();
         app
+    }
+
+    pub fn begin_password_prompt(&mut self, failures: u8) {
+        self.password_prompt = Some(PasswordPrompt::new(failures));
+        self.set_status(PASSWORD_PROMPT, false);
+    }
+
+    pub fn take_password_prompt(&mut self) -> Option<PasswordPrompt> {
+        self.password_prompt.take()
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -281,6 +359,9 @@ impl App {
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
+    if app.password_prompt.is_some() {
+        return handle_password_key(app, key);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return Action::Quit;
     }
@@ -292,16 +373,26 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Char('2') if !app.focus.is_text() || app.tab != Tab::Config => {
             app.tab = Tab::Run;
+            if !matches!(app.focus, Focus::Stop | Focus::Restart) {
+                app.focus = Focus::Stop;
+            }
             return Action::None;
         }
         KeyCode::Tab => {
             app.tab = match app.tab {
-                Tab::Config => Tab::Run,
+                Tab::Config => {
+                    app.focus = Focus::Stop;
+                    Tab::Run
+                }
                 Tab::Run => Tab::Config,
             };
             return Action::None;
         }
         _ => {}
+    }
+
+    if app.tab == Tab::Run {
+        return handle_run_key(app, key);
     }
 
     if app.tab != Tab::Config {
@@ -357,9 +448,57 @@ fn activate(app: &mut App) -> Action {
         Focus::Save => return Action::Save,
         Focus::Start => return Action::Start,
         Focus::UpdateHy => return Action::UpdateHy,
+        Focus::Stop => return Action::Stop,
+        Focus::Restart => return Action::Restart,
         _ => {}
     }
     Action::None
+}
+
+fn handle_run_key(app: &mut App, key: KeyEvent) -> Action {
+    let order = run_focus_order();
+    if !order.contains(&app.focus) {
+        app.focus = order[0];
+    }
+    match key.code {
+        KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
+            app.focus = order[0];
+            Action::None
+        }
+        KeyCode::Right | KeyCode::Down => {
+            app.focus = order[1];
+            Action::None
+        }
+        KeyCode::Char(' ') | KeyCode::Enter => activate(app),
+        _ => Action::None,
+    }
+}
+
+fn handle_password_key(app: &mut App, key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        let _ = app.take_password_prompt();
+        return Action::PasswordCancel;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            let _ = app.take_password_prompt();
+            Action::PasswordCancel
+        }
+        KeyCode::Enter => Action::PasswordSubmit,
+        KeyCode::Backspace => {
+            if let Some(p) = app.password_prompt.as_mut() {
+                p.buf.pop();
+            }
+            Action::None
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(p) = app.password_prompt.as_mut() {
+                p.buf.push(c);
+            }
+            Action::None
+        }
+        _ => Action::None,
+    }
 }
 
 pub fn note_save_ok(app: &mut App, path: &str) {
@@ -396,9 +535,11 @@ pub fn note_fetch_err(app: &mut App, err: &str) {
 }
 
 pub fn note_starting(app: &mut App) {
+    app.run_phase = RunPhase::Starting;
     app.set_status("preparing start…", false);
 }
 
+#[allow(dead_code)]
 pub fn note_start_ok(app: &mut App, prepared: &spawn::PreparedStart) {
     let cmd = spawn::format_argv(&prepared.argv);
     if prepared.ruleset_warning {
@@ -408,13 +549,88 @@ pub fn note_start_ok(app: &mut App, prepared: &spawn::PreparedStart) {
     }
 }
 
+pub fn note_need_password(app: &mut App, failures: u8) {
+    app.tab = Tab::Config;
+    app.begin_password_prompt(failures);
+}
+
+pub fn note_password_cancel(app: &mut App) {
+    app.run_phase = RunPhase::Stopped;
+    app.hy_pid = None;
+    app.set_status("已取消启动", false);
+}
+
+pub fn note_password_fail(app: &mut App, failures: u8, locked: bool) {
+    app.tab = Tab::Config;
+    if locked {
+        app.run_phase = RunPhase::Stopped;
+        app.hy_pid = None;
+        app.set_status("sudo 密码错误三次，未启动 hy", true);
+    } else {
+        app.begin_password_prompt(failures);
+        app.set_status(
+            format!(
+                "sudo 密码错误（{failures}/{}），请重试",
+                sudo::MAX_PASSWORD_FAILS
+            ),
+            true,
+        );
+    }
+}
+
+pub fn note_spawned(app: &mut App, pid: u32, ruleset_warning: bool) {
+    app.tab = Tab::Run;
+    app.focus = Focus::Stop;
+    app.run_phase = RunPhase::Running;
+    app.hy_pid = Some(pid);
+    let msg = format!("hy pid {pid}");
+    if ruleset_warning {
+        app.set_status_warn(format!("{}  {msg}", fetch_route::RULESET_UNUSABLE));
+    } else {
+        app.set_status(msg, false);
+    }
+}
+
+pub fn note_stopping(app: &mut App) {
+    app.run_phase = RunPhase::Stopping;
+    app.set_status("stopping (SIGINT)…", false);
+}
+
+pub fn note_stopped(app: &mut App) {
+    app.run_phase = RunPhase::Stopped;
+    app.hy_pid = None;
+    app.set_status("STOPPED", false);
+}
+
+pub fn note_hy_exited(app: &mut App) {
+    app.run_phase = RunPhase::Error;
+    app.hy_pid = None;
+    app.set_status("hy exited", true);
+}
+
+pub fn note_no_tty(app: &mut App) {
+    app.run_phase = RunPhase::Stopped;
+    app.set_status(sudo::NO_TTY_MSG, true);
+}
+
 pub fn note_start_err(app: &mut App, err: &str) {
+    app.run_phase = RunPhase::Stopped;
+    app.hy_pid = None;
     let one_line: String = err
         .chars()
         .map(|c| if c == '\n' { ' ' } else { c })
         .take(240)
         .collect();
     app.set_status(format!("start failed: {one_line}"), true);
+}
+
+pub fn note_stop_err(app: &mut App, err: &str) {
+    let one_line: String = err
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .take(240)
+        .collect();
+    app.set_status(format!("stop failed: {one_line}"), true);
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -455,19 +671,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match app.tab {
         Tab::Config => draw_config(frame, app, chunks[2]),
-        Tab::Run => draw_run(frame, chunks[2]),
+        Tab::Run => draw_run(frame, app, chunks[2]),
     }
 
     draw_footer(frame, app, chunks[3]);
+    if app.password_prompt.is_some() {
+        draw_password_overlay(frame, app, frame.area());
+    }
 }
 
-fn draw_run(frame: &mut Frame, area: Rect) {
+fn draw_run(frame: &mut Frame, app: &App, area: Rect) {
+    let pid = app
+        .hy_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "—".into());
     let p = Paragraph::new(vec![
         Line::from(""),
-        Line::from("Run tab (U1 stub)"),
+        Line::from(format!("status: {}", app.run_phase.label())),
+        Line::from(format!("pid: {pid}")),
         Line::from(""),
-        Line::from("Start records argv (no sudo / no TUN). Stop / logs / ifstats are U4–U5."),
-        Line::from("Save from Config still writes ~/.hy/client.yaml."),
+        Line::from("Stop = SIGINT to hy (then SIGTERM on timeout). Never SIGKILL."),
+        Line::from("U5 will fill TUN rates and the log pane."),
         Line::from(""),
         Line::from("Tab / 1 / 2  switch tabs    Esc  quit"),
     ])
@@ -477,7 +701,12 @@ fn draw_run(frame: &mut Frame, area: Rect) {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let btn = |id: Focus, label: &str| -> Span<'static> {
-        let focused = app.tab == Tab::Config && app.focus == id;
+        let focused = match app.tab {
+            Tab::Config => {
+                matches!(id, Focus::Save | Focus::Start | Focus::UpdateHy) && app.focus == id
+            }
+            Tab::Run => matches!(id, Focus::Stop | Focus::Restart) && app.focus == id,
+        };
         let style = if focused {
             Style::default()
                 .fg(Color::Black)
@@ -488,16 +717,53 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         };
         Span::styled(format!(" {label} "), style)
     };
-    let line = Line::from(vec![
-        btn(Focus::Save, "Save"),
-        Span::raw("  "),
-        btn(Focus::Start, "Start"),
-        Span::raw("  "),
-        btn(Focus::UpdateHy, "Update hy"),
-        Span::raw("    Enter=Save when focused   Space=toggle   ↑↓=move"),
-    ]);
+    let line = match app.tab {
+        Tab::Config => Line::from(vec![
+            btn(Focus::Save, "Save"),
+            Span::raw("  "),
+            btn(Focus::Start, "Start"),
+            Span::raw("  "),
+            btn(Focus::UpdateHy, "Update hy"),
+            Span::raw("    Enter=activate when focused   Space=toggle   ↑↓=move"),
+        ]),
+        Tab::Run => Line::from(vec![
+            btn(Focus::Stop, "Stop"),
+            Span::raw("  "),
+            btn(Focus::Restart, "Restart"),
+            Span::raw("    Enter=activate   Stop=SIGINT then SIGTERM"),
+        ]),
+    };
     let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("actions"));
     frame.render_widget(p, area);
+}
+
+fn draw_password_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(prompt) = app.password_prompt.as_ref() else {
+        return;
+    };
+    let w = 52.min(area.width.saturating_sub(2)).max(24);
+    let h = 7.min(area.height.saturating_sub(2)).max(5);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect::new(x, y, w, h);
+    let mask = "•".repeat(prompt.len());
+    let attempt = prompt.failures + 1;
+    let lines = vec![
+        Line::from(PASSWORD_PROMPT),
+        Line::from(format!("Password: {mask}│")),
+        Line::from(format!(
+            "Enter=OK  Esc=取消  ({attempt}/{})",
+            sudo::MAX_PASSWORD_FAILS
+        )),
+    ];
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("sudo")
+            .style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(Clear, rect);
+    frame.render_widget(p, rect);
 }
 
 fn draw_config(frame: &mut Frame, app: &App, area: Rect) {
@@ -535,7 +801,7 @@ fn focused_line_index(app: &App) -> Option<usize> {
         Focus::RouteOff | Focus::RouteLocal | Focus::RouteUrl => 12,
         Focus::RouteLocalPath | Focus::RouteUrlValue => 13,
         Focus::AdvancedToggle => 15,
-        Focus::Save | Focus::Start | Focus::UpdateHy => 0,
+        Focus::Save | Focus::Start | Focus::UpdateHy | Focus::Stop | Focus::Restart => 0,
         _ => 16,
     })
 }
@@ -752,4 +1018,41 @@ fn radio_row(app: &App, mode: RouteMode) -> Line<'static> {
         item(Focus::RouteLocal, RouteMode::Local, "local"),
         item(Focus::RouteUrl, RouteMode::Url, "url"),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn password_esc_cancels_and_does_not_quit() {
+        let mut app = App::new();
+        app.begin_password_prompt(0);
+        let action = handle_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(action, Action::PasswordCancel));
+        assert!(app.password_prompt.is_none());
+    }
+
+    #[test]
+    fn password_enter_submits() {
+        let mut app = App::new();
+        app.begin_password_prompt(1);
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(action, Action::PasswordSubmit));
+        assert!(app.password_prompt.is_some());
+    }
+
+    #[test]
+    fn run_enter_on_stop_is_stop_action() {
+        let mut app = App::new();
+        app.tab = Tab::Run;
+        app.focus = Focus::Stop;
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(action, Action::Stop));
+    }
 }
