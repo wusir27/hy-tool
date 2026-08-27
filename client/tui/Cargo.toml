@@ -3,7 +3,7 @@ name = "hy-tui"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Terminal UI to write hy client.yaml and download hy (U2: Save + Update hy)"
+description = "Terminal UI to write hy client.yaml, download hy, and Start with --route (U3)"
 publish = false
 
 [[bin]]

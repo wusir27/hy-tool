@@ -1,6 +1,8 @@
 //! Config form widgets and key handling (keyboard-only).
 
 use crate::config_gen::{FormState, RouteMode};
+use crate::fetch_route;
+use crate::spawn;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,7 +10,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-pub const STATUS_HINT: &str = "U2: Save writes yaml; Update hy installs ~/.hy/bin/hy";
+pub const STATUS_HINT: &str =
+    "U3: Save writes yaml; Start shows argv (--route if url/local); Update hy installs ~/.hy/bin/hy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -148,6 +151,7 @@ pub enum Action {
     None,
     Quit,
     Save,
+    Start,
     UpdateHy,
 }
 
@@ -157,6 +161,7 @@ pub struct App {
     pub focus: Focus,
     pub status: String,
     pub status_error: bool,
+    pub status_warn: bool,
     pub cursor: usize,
     scroll: u16,
 }
@@ -169,6 +174,7 @@ impl App {
             focus: Focus::Server,
             status: STATUS_HINT.to_string(),
             status_error: false,
+            status_warn: false,
             cursor: 0,
             scroll: 0,
         };
@@ -179,6 +185,13 @@ impl App {
     pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
         self.status = text.into();
         self.status_error = error;
+        self.status_warn = false;
+    }
+
+    pub fn set_status_warn(&mut self, text: impl Into<String>) {
+        self.status = text.into();
+        self.status_error = false;
+        self.status_warn = true;
     }
 
     fn focused_text_mut(&mut self) -> Option<&mut String> {
@@ -342,9 +355,7 @@ fn activate(app: &mut App) -> Action {
         Focus::Lazy => app.form.lazy = !app.form.lazy,
         Focus::FastOpen => app.form.fast_open = !app.form.fast_open,
         Focus::Save => return Action::Save,
-        Focus::Start => {
-            app.set_status("Start is a no-op until U4", false);
-        }
+        Focus::Start => return Action::Start,
         Focus::UpdateHy => return Action::UpdateHy,
         _ => {}
     }
@@ -384,6 +395,28 @@ pub fn note_fetch_err(app: &mut App, err: &str) {
     app.set_status(one_line, true);
 }
 
+pub fn note_starting(app: &mut App) {
+    app.set_status("preparing start…", false);
+}
+
+pub fn note_start_ok(app: &mut App, prepared: &spawn::PreparedStart) {
+    let cmd = spawn::format_argv(&prepared.argv);
+    if prepared.ruleset_warning {
+        app.set_status_warn(format!("{}  {cmd}", fetch_route::RULESET_UNUSABLE));
+    } else {
+        app.set_status(cmd, false);
+    }
+}
+
+pub fn note_start_err(app: &mut App, err: &str) {
+    let one_line: String = err
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .take(240)
+        .collect();
+    app.set_status(format!("start failed: {one_line}"), true);
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -412,6 +445,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let status_style = if app.status_error {
         Style::default().fg(Color::Red)
+    } else if app.status_warn {
+        Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::Cyan)
     };
@@ -431,7 +466,7 @@ fn draw_run(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("Run tab (U1 stub)"),
         Line::from(""),
-        Line::from("Start / Stop / logs / ifstats are not implemented."),
+        Line::from("Start records argv (no sudo / no TUN). Stop / logs / ifstats are U4–U5."),
         Line::from("Save from Config still writes ~/.hy/client.yaml."),
         Line::from(""),
         Line::from("Tab / 1 / 2  switch tabs    Esc  quit"),
@@ -542,7 +577,7 @@ fn form_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(radio_row(app, f.route_mode));
     match f.route_mode {
         RouteMode::Off => lines.push(dim(
-            "  (U1: selection is in-memory only; Save does not write route.file)",
+            "  off: Start omits --route; Save still does not write route.file",
         )),
         RouteMode::Local => {
             lines.push(text_row(
@@ -551,6 +586,7 @@ fn form_lines(app: &App) -> Vec<Line<'static>> {
                 "local .conf",
                 &f.route_local_path,
             ));
+            lines.push(dim("  Start passes --route <abs path> (file must exist)"));
         }
         RouteMode::Url => {
             lines.push(text_row(
@@ -558,6 +594,9 @@ fn form_lines(app: &App) -> Vec<Line<'static>> {
                 Focus::RouteUrlValue,
                 "HTTPS URL",
                 &f.route_url,
+            ));
+            lines.push(dim(
+                "  Start downloads to ~/.hy/route.conf and passes --route",
             ));
         }
     }
