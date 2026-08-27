@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-pub const STATUS_U1: &str = "U1: Save only";
+pub const STATUS_HINT: &str = "U2: Save writes yaml; Update hy installs ~/.hy/bin/hy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -47,6 +47,7 @@ pub enum Focus {
     Lazy,
     FastOpen,
     Socks5Listen,
+    HyPath,
     Save,
     Start,
     UpdateHy,
@@ -77,6 +78,7 @@ impl Focus {
                 | Focus::QuicMaxConn
                 | Focus::TunIpv6
                 | Focus::Socks5Listen
+                | Focus::HyPath
         )
     }
 }
@@ -118,6 +120,7 @@ fn focus_order(form: &FormState) -> Vec<Focus> {
             Focus::Lazy,
             Focus::FastOpen,
             Focus::Socks5Listen,
+            Focus::HyPath,
         ]);
     }
     v.extend([Focus::Save, Focus::Start, Focus::UpdateHy]);
@@ -145,6 +148,7 @@ pub enum Action {
     None,
     Quit,
     Save,
+    UpdateHy,
 }
 
 pub struct App {
@@ -152,6 +156,7 @@ pub struct App {
     pub form: FormState,
     pub focus: Focus,
     pub status: String,
+    pub status_error: bool,
     pub cursor: usize,
     scroll: u16,
 }
@@ -162,7 +167,8 @@ impl App {
             tab: Tab::Config,
             form: FormState::default(),
             focus: Focus::Server,
-            status: STATUS_U1.to_string(),
+            status: STATUS_HINT.to_string(),
+            status_error: false,
             cursor: 0,
             scroll: 0,
         };
@@ -170,12 +176,9 @@ impl App {
         app
     }
 
-    fn set_status_extra(&mut self, extra: &str) {
-        if extra.is_empty() {
-            self.status = STATUS_U1.to_string();
-        } else {
-            self.status = format!("{STATUS_U1} | {extra}");
-        }
+    pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
+        self.status = text.into();
+        self.status_error = error;
     }
 
     fn focused_text_mut(&mut self) -> Option<&mut String> {
@@ -201,6 +204,7 @@ impl App {
             Focus::QuicMaxConn => &mut self.form.quic_max_conn_window,
             Focus::TunIpv6 => &mut self.form.tun_ipv6,
             Focus::Socks5Listen => &mut self.form.socks5_listen,
+            Focus::HyPath => &mut self.form.hy_path,
             _ => return None,
         })
     }
@@ -338,20 +342,46 @@ fn activate(app: &mut App) -> Action {
         Focus::Lazy => app.form.lazy = !app.form.lazy,
         Focus::FastOpen => app.form.fast_open = !app.form.fast_open,
         Focus::Save => return Action::Save,
-        Focus::Start | Focus::UpdateHy => {
-            app.set_status_extra("Start / Update hy are no-ops in U1");
+        Focus::Start => {
+            app.set_status("Start is a no-op until U4", false);
         }
+        Focus::UpdateHy => return Action::UpdateHy,
         _ => {}
     }
     Action::None
 }
 
 pub fn note_save_ok(app: &mut App, path: &str) {
-    app.set_status_extra(&format!("saved {path}"));
+    app.set_status(format!("saved {path}"), false);
 }
 
 pub fn note_save_err(app: &mut App, err: &str) {
-    app.set_status_extra(&format!("save failed: {err}"));
+    app.set_status(format!("save failed: {err}"), true);
+}
+
+pub fn note_downloading(app: &mut App) {
+    app.set_status("downloading…", false);
+}
+
+pub fn note_fetch_ok(app: &mut App, tag: &str) {
+    let tag = tag.trim();
+    let v = if tag.is_empty() {
+        String::new()
+    } else if tag.starts_with(['v', 'V']) {
+        format!(" ({tag})")
+    } else {
+        format!(" (v{tag})")
+    };
+    app.set_status(format!("hy → ~/.hy/bin/hy{v}"), false);
+}
+
+pub fn note_fetch_err(app: &mut App, err: &str) {
+    let one_line: String = err
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .take(240)
+        .collect();
+    app.set_status(one_line, true);
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -359,9 +389,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(3),
-            Constraint::Length(1),
         ])
         .split(frame.area());
 
@@ -380,14 +410,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .select(selected);
     frame.render_widget(tabs, chunks[0]);
 
+    let status_style = if app.status_error {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let status = Paragraph::new(app.status.as_str()).style(status_style);
+    frame.render_widget(status, chunks[1]);
+
     match app.tab {
-        Tab::Config => draw_config(frame, app, chunks[1]),
-        Tab::Run => draw_run(frame, chunks[1]),
+        Tab::Config => draw_config(frame, app, chunks[2]),
+        Tab::Run => draw_run(frame, chunks[2]),
     }
 
-    draw_footer(frame, app, chunks[2]);
-    let status = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Cyan));
-    frame.render_widget(status, chunks[3]);
+    draw_footer(frame, app, chunks[3]);
 }
 
 fn draw_run(frame: &mut Frame, area: Rect) {
@@ -588,7 +624,10 @@ fn form_lines(app: &App) -> Vec<Line<'static>> {
             "socks5.listen",
             &f.socks5_listen,
         ));
-        lines.push(dim("  empty advanced keys are omitted from yaml"));
+        lines.push(text_row(app, Focus::HyPath, "hy path", &f.hy_path));
+        lines.push(dim(
+            "  empty advanced keys are omitted from yaml; Update hy always writes ~/.hy/bin/hy",
+        ));
     }
     lines
 }

@@ -50,6 +50,8 @@ pub struct FormState {
     pub lazy: bool,
     pub fast_open: bool,
     pub socks5_listen: String,
+    /// Advanced: custom hy binary path (U4 Start). Download still targets ~/.hy/bin/hy.
+    pub hy_path: String,
 }
 
 impl Default for FormState {
@@ -82,6 +84,7 @@ impl Default for FormState {
             lazy: false,
             fast_open: false,
             socks5_listen: String::new(),
+            hy_path: String::new(),
         }
     }
 }
@@ -524,6 +527,12 @@ mod tests {
         assert!(
             !yaml.contains("https://example.com/sr.conf"),
             "must not persist URL into yaml in U1\n{yaml}"
+        );
+        form.hy_path = "/opt/custom/hy".into();
+        let yaml = to_yaml(&form);
+        assert!(
+            !yaml.contains("/opt/custom/hy"),
+            "hy path is TUI-only and must not be written to client.yaml\n{yaml}"
         );
     }
 
