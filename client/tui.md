@@ -72,6 +72,8 @@ Config 分组：**连接** / **TUN** / **路由** / **高级**（默认折叠）
 
 4. **Save**：只写 `~/.hy/client.yaml`，**不**启动 hy。Save **不**写 `route.file`。空的高级字段不会进 yaml。
 
+下次打开会把 `~/.hy/client.yaml` 读回表单，规则缓存（off/local/url、URL、本地路径）从 `~/.hy/tui.json` 读回。
+
 > 高级（展开后）：`bandwidth`、`obfs`、hop 端口、`quic` 窗口、`address.ipv6`、`lazy` / `fastOpen`、可选 `socks5.listen`、`hy path`。不需要就保持折叠。
 
 ---
@@ -154,6 +156,7 @@ Run 底栏 **Stop** = 对 hy 的 pid 发 **SIGINT**（与 USAGE 的 Ctrl+C 相�
 ~/.hy/
   bin/hy          # 下载的官方 hy
   client.yaml     # TUI Save / Start 写出
+  tui.json        # 0600；规则单选 off/local/url、URL、本地路径；不含 auth
   route.conf      # 可选；url 模式下载到这里
 ```
 
