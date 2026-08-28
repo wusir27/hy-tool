@@ -1,16 +1,18 @@
 //! hy-tui: Config form + Save (U1) + download hy (U2) + rules URL / --route (U3)
-//! + sudo Start / SIGINT Stop (U4).
+//! + sudo Start / SIGINT Stop (U4) + Run logs / TUN ifstats (U5).
 
 mod config_gen;
 mod detect;
 mod fetch_hy;
 mod fetch_route;
+mod ifstats;
+mod logbuf;
 mod spawn;
 mod sudo;
 mod ui;
 
 use std::io::{self, stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -100,7 +102,8 @@ impl Runtime {
         self.take_prepare(app).await;
         self.take_spawn(app).await;
         self.take_stop(app).await;
-        self.poll_child(app);
+        self.poll_logs_and_child(app);
+        self.sample_ifstats(app);
     }
 
     async fn take_prepare(&mut self, app: &mut App) {
@@ -191,6 +194,7 @@ impl Runtime {
         self.restart_after_stop = false;
         match handle.await {
             Ok(Ok(())) => {
+                ui::append_logs(app, self.session.poll_logs());
                 ui::note_stopped(app);
                 if restart {
                     begin_start(self, app).await;
@@ -201,15 +205,34 @@ impl Runtime {
         }
     }
 
-    fn poll_child(&mut self, app: &mut App) {
+    fn poll_logs_and_child(&mut self, app: &mut App) {
+        ui::append_logs(app, self.session.poll_logs());
         if self.stop_job.is_some() || self.spawn_job.is_some() {
             return;
         }
         let dead = self.session.process.as_mut().is_some_and(|p| !p.is_alive());
         if dead {
+            ui::append_logs(app, self.session.poll_logs());
             self.session.process = None;
             ui::note_hy_exited(app);
         }
+    }
+
+    fn sample_ifstats(&mut self, app: &mut App) {
+        let watching = self.session.has_child()
+            && matches!(
+                app.run_phase,
+                ui::RunPhase::Starting | ui::RunPhase::Running | ui::RunPhase::Stopping
+            );
+        if !watching {
+            return;
+        }
+        let now = Instant::now();
+        if !app.ifstats.due(now, ifstats::SAMPLE_INTERVAL) {
+            return;
+        }
+        let name = app.form.tun_name.trim();
+        app.ifstats.sample(now, ifstats::read_iface(name));
     }
 
     fn request_stop(&mut self, app: &mut App, then_start: bool) {
@@ -341,6 +364,9 @@ async fn main() -> Result<()> {
                 rt.pending_plan = None;
                 rt.session.cancel();
                 ui::note_password_cancel(&mut app);
+            }
+            Action::ClearLog => {
+                app.log.clear();
             }
             Action::None => {}
         }

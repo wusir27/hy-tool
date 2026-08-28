@@ -3,7 +3,7 @@ name = "hy-tui"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Terminal UI to write hy client.yaml, download hy, and Start hy via sudo (U4)"
+description = "Terminal UI to write hy client.yaml, Start hy via sudo, and show TUN rates + logs (U5)"
 publish = false
 
 [[bin]]

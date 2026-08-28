@@ -2,6 +2,8 @@
 
 use crate::config_gen::{FormState, RouteMode};
 use crate::fetch_route;
+use crate::ifstats::{self, IfStats};
+use crate::logbuf::LogRing;
 use crate::spawn;
 use crate::sudo::{self, PASSWORD_PROMPT};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,10 +12,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use std::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const STATUS_HINT: &str =
-    "U4: Start launches hy via sudo; Stop = SIGINT. Save / Update hy unchanged";
+    "U5: Run tab shows hy logs and TUN 出/入 rates. Stop / missing iface → —";
+
+pub const RATE_CAPTION: &str = "虚拟网卡 IP 包，不是 QUIC/UDP 线字节";
+
+pub const RATE_CAPTION_ROUTE: &str =
+    "虚拟网卡 IP 包，不是 QUIC/UDP 线字节。开了 --route 时 TUN 含后来的 DIRECT/REJECT，并非纯隧道";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -58,6 +66,7 @@ pub enum Focus {
     UpdateHy,
     Stop,
     Restart,
+    ClearLog,
 }
 
 impl Focus {
@@ -134,8 +143,8 @@ fn focus_order(form: &FormState) -> Vec<Focus> {
     v
 }
 
-fn run_focus_order() -> [Focus; 2] {
-    [Focus::Stop, Focus::Restart]
+fn run_focus_order() -> [Focus; 3] {
+    [Focus::Stop, Focus::Restart, Focus::ClearLog]
 }
 
 fn next_focus(form: &FormState, cur: Focus) -> Focus {
@@ -165,6 +174,7 @@ pub enum Action {
     Restart,
     PasswordSubmit,
     PasswordCancel,
+    ClearLog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,12 +187,13 @@ pub enum RunPhase {
 }
 
 impl RunPhase {
+    /// Public Run-tab labels are only STOPPED / STARTING / CONNECTED / ERROR.
     pub fn label(self) -> &'static str {
         match self {
             Self::Stopped => "STOPPED",
             Self::Starting => "STARTING",
-            Self::Running => "RUNNING",
-            Self::Stopping => "STOPPING",
+            Self::Running => "CONNECTED",
+            Self::Stopping => "STARTING",
             Self::Error => "ERROR",
         }
     }
@@ -230,6 +241,10 @@ pub struct App {
     pub run_phase: RunPhase,
     pub hy_pid: Option<u32>,
     pub password_prompt: Option<PasswordPrompt>,
+    pub log: LogRing,
+    pub ifstats: IfStats,
+    pub started_at: Option<Instant>,
+    pub saw_success: bool,
 }
 
 impl App {
@@ -246,6 +261,10 @@ impl App {
             run_phase: RunPhase::Stopped,
             hy_pid: None,
             password_prompt: None,
+            log: LogRing::new(),
+            ifstats: IfStats::new(),
+            started_at: None,
+            saw_success: false,
         };
         app.sync_cursor();
         app
@@ -373,7 +392,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Char('2') if !app.focus.is_text() || app.tab != Tab::Config => {
             app.tab = Tab::Run;
-            if !matches!(app.focus, Focus::Stop | Focus::Restart) {
+            if !matches!(app.focus, Focus::Stop | Focus::Restart | Focus::ClearLog) {
                 app.focus = Focus::Stop;
             }
             return Action::None;
@@ -450,6 +469,7 @@ fn activate(app: &mut App) -> Action {
         Focus::UpdateHy => return Action::UpdateHy,
         Focus::Stop => return Action::Stop,
         Focus::Restart => return Action::Restart,
+        Focus::ClearLog => return Action::ClearLog,
         _ => {}
     }
     Action::None
@@ -457,16 +477,17 @@ fn activate(app: &mut App) -> Action {
 
 fn handle_run_key(app: &mut App, key: KeyEvent) -> Action {
     let order = run_focus_order();
+    let i = order.iter().position(|f| *f == app.focus).unwrap_or(0);
     if !order.contains(&app.focus) {
         app.focus = order[0];
     }
     match key.code {
         KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
-            app.focus = order[0];
+            app.focus = order[(i + order.len() - 1) % order.len()];
             Action::None
         }
         KeyCode::Right | KeyCode::Down => {
-            app.focus = order[1];
+            app.focus = order[(i + 1) % order.len()];
             Action::None
         }
         KeyCode::Char(' ') | KeyCode::Enter => activate(app),
@@ -536,6 +557,8 @@ pub fn note_fetch_err(app: &mut App, err: &str) {
 
 pub fn note_starting(app: &mut App) {
     app.run_phase = RunPhase::Starting;
+    app.saw_success = false;
+    app.ifstats.reset();
     app.set_status("preparing start…", false);
 }
 
@@ -557,6 +580,9 @@ pub fn note_need_password(app: &mut App, failures: u8) {
 pub fn note_password_cancel(app: &mut App) {
     app.run_phase = RunPhase::Stopped;
     app.hy_pid = None;
+    app.started_at = None;
+    app.saw_success = false;
+    app.ifstats.reset();
     app.set_status("已取消启动", false);
 }
 
@@ -565,6 +591,9 @@ pub fn note_password_fail(app: &mut App, failures: u8, locked: bool) {
     if locked {
         app.run_phase = RunPhase::Stopped;
         app.hy_pid = None;
+        app.started_at = None;
+        app.saw_success = false;
+        app.ifstats.reset();
         app.set_status("sudo 密码错误三次，未启动 hy", true);
     } else {
         app.begin_password_prompt(failures);
@@ -581,8 +610,11 @@ pub fn note_password_fail(app: &mut App, failures: u8, locked: bool) {
 pub fn note_spawned(app: &mut App, pid: u32, ruleset_warning: bool) {
     app.tab = Tab::Run;
     app.focus = Focus::Stop;
-    app.run_phase = RunPhase::Running;
+    app.run_phase = RunPhase::Starting;
     app.hy_pid = Some(pid);
+    app.started_at = Some(Instant::now());
+    app.saw_success = false;
+    app.ifstats.reset();
     let msg = format!("hy pid {pid}");
     if ruleset_warning {
         app.set_status_warn(format!("{}  {msg}", fetch_route::RULESET_UNUSABLE));
@@ -599,23 +631,35 @@ pub fn note_stopping(app: &mut App) {
 pub fn note_stopped(app: &mut App) {
     app.run_phase = RunPhase::Stopped;
     app.hy_pid = None;
+    app.started_at = None;
+    app.saw_success = false;
+    app.ifstats.reset();
     app.set_status("STOPPED", false);
 }
 
 pub fn note_hy_exited(app: &mut App) {
     app.run_phase = RunPhase::Error;
     app.hy_pid = None;
+    app.started_at = None;
+    app.ifstats.reset();
     app.set_status("hy exited", true);
 }
 
 pub fn note_no_tty(app: &mut App) {
     app.run_phase = RunPhase::Stopped;
+    app.hy_pid = None;
+    app.started_at = None;
+    app.saw_success = false;
+    app.ifstats.reset();
     app.set_status(sudo::NO_TTY_MSG, true);
 }
 
 pub fn note_start_err(app: &mut App, err: &str) {
     app.run_phase = RunPhase::Stopped;
     app.hy_pid = None;
+    app.started_at = None;
+    app.saw_success = false;
+    app.ifstats.reset();
     let one_line: String = err
         .chars()
         .map(|c| if c == '\n' { ' ' } else { c })
@@ -631,6 +675,63 @@ pub fn note_stop_err(app: &mut App, err: &str) {
         .take(240)
         .collect();
     app.set_status(format!("stop failed: {one_line}"), true);
+}
+
+/// CONNECTED when the child is still alive and a success line has been seen.
+/// Case-insensitive substring; does not parse the protocol.
+pub fn line_means_connected(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    if l.contains("tun up") || l.contains("tunnel up") || l.contains("tun listening") {
+        return true;
+    }
+    if l.contains("authenticated") && !l.contains("unauthenticated") {
+        return true;
+    }
+    if l.contains("connected") && !l.contains("disconnected") {
+        return true;
+    }
+    false
+}
+
+pub fn append_logs(app: &mut App, lines: impl IntoIterator<Item = String>) {
+    for line in lines {
+        if line_means_connected(&line) {
+            app.saw_success = true;
+        }
+        app.log.push(line);
+    }
+    if app.saw_success
+        && app.hy_pid.is_some()
+        && matches!(app.run_phase, RunPhase::Starting | RunPhase::Running)
+    {
+        app.run_phase = RunPhase::Running;
+    }
+}
+
+fn rate_caption(form: &FormState) -> &'static str {
+    match form.route_mode {
+        RouteMode::Off => RATE_CAPTION,
+        RouteMode::Local | RouteMode::Url => RATE_CAPTION_ROUTE,
+    }
+}
+
+fn fmt_uptime(started: Option<Instant>) -> String {
+    let Some(t0) = started else {
+        return "—".into();
+    };
+    let s = Instant::now().saturating_duration_since(t0).as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn status_style(phase: RunPhase) -> Style {
+    match phase {
+        RunPhase::Running => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        RunPhase::Error => Style::default().fg(Color::Red),
+        RunPhase::Starting | RunPhase::Stopping => Style::default().fg(Color::Yellow),
+        RunPhase::Stopped => Style::default().fg(Color::DarkGray),
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -681,22 +782,69 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_run(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(4)])
+        .split(area);
+
     let pid = app
         .hy_pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "—".into());
-    let p = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(format!("status: {}", app.run_phase.label())),
-        Line::from(format!("pid: {pid}")),
-        Line::from(""),
-        Line::from("Stop = SIGINT to hy (then SIGTERM on timeout). Never SIGKILL."),
-        Line::from("U5 will fill TUN rates and the log pane."),
-        Line::from(""),
-        Line::from("Tab / 1 / 2  switch tabs    Esc  quit"),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Run"));
-    frame.render_widget(p, area);
+    let snap = app.ifstats.snapshot();
+    let out_spark = ifstats::sparkline(&app.ifstats.out_history());
+    let in_spark = ifstats::sparkline(&app.ifstats.in_history());
+    let out_rate = ifstats::format_rate(snap.out_bps);
+    let in_rate = ifstats::format_rate(snap.in_bps);
+    let out_tot = ifstats::format_total(snap.cum_out);
+    let in_tot = ifstats::format_total(snap.cum_in);
+
+    let header = vec![
+        Line::from(vec![
+            Span::raw("status: "),
+            Span::styled(app.run_phase.label(), status_style(app.run_phase)),
+            Span::raw(format!(
+                "   server: {}   tun: {}",
+                app.form.server.trim(),
+                app.form.tun_name.trim()
+            )),
+        ]),
+        Line::from(format!(
+            "pid: {pid}   uptime: {}",
+            fmt_uptime(app.started_at)
+        )),
+        Line::from(format!("TUN 出  {out_rate}  累计 {out_tot}  {out_spark}")),
+        Line::from(format!("TUN 入  {in_rate}  累计 {in_tot}  {in_spark}")),
+        Line::from(Span::styled(
+            rate_caption(&app.form),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(header)
+            .block(Block::default().borders(Borders::ALL).title("Run"))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    let log_h = chunks[1].height.saturating_sub(2) as usize;
+    let log_lines: Vec<Line> = app
+        .log
+        .last_n(log_h.max(1))
+        .map(|s| Line::from(s.to_string()))
+        .collect();
+    let log = if log_lines.is_empty() {
+        Paragraph::new(Span::styled(
+            "(no log yet)",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Paragraph::new(log_lines)
+    };
+    frame.render_widget(
+        log.block(Block::default().borders(Borders::ALL).title("log")),
+        chunks[1],
+    );
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -705,7 +853,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Config => {
                 matches!(id, Focus::Save | Focus::Start | Focus::UpdateHy) && app.focus == id
             }
-            Tab::Run => matches!(id, Focus::Stop | Focus::Restart) && app.focus == id,
+            Tab::Run => {
+                matches!(id, Focus::Stop | Focus::Restart | Focus::ClearLog) && app.focus == id
+            }
         };
         let style = if focused {
             Style::default()
@@ -730,6 +880,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             btn(Focus::Stop, "Stop"),
             Span::raw("  "),
             btn(Focus::Restart, "Restart"),
+            Span::raw("  "),
+            btn(Focus::ClearLog, "Clear log"),
             Span::raw("    Enter=activate   Stop=SIGINT then SIGTERM"),
         ]),
     };
@@ -801,7 +953,12 @@ fn focused_line_index(app: &App) -> Option<usize> {
         Focus::RouteOff | Focus::RouteLocal | Focus::RouteUrl => 12,
         Focus::RouteLocalPath | Focus::RouteUrlValue => 13,
         Focus::AdvancedToggle => 15,
-        Focus::Save | Focus::Start | Focus::UpdateHy | Focus::Stop | Focus::Restart => 0,
+        Focus::Save
+        | Focus::Start
+        | Focus::UpdateHy
+        | Focus::Stop
+        | Focus::Restart
+        | Focus::ClearLog => 0,
         _ => 16,
     })
 }
@@ -1054,5 +1211,101 @@ mod tests {
         app.focus = Focus::Stop;
         let action = handle_key(&mut app, key(KeyCode::Enter));
         assert!(matches!(action, Action::Stop));
+    }
+
+    #[test]
+    fn run_enter_on_clear_log_is_clear_action() {
+        let mut app = App::new();
+        app.tab = Tab::Run;
+        app.focus = Focus::ClearLog;
+        app.log.push("keep-until-action".into());
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(action, Action::ClearLog));
+    }
+
+    #[test]
+    fn success_line_detector() {
+        assert!(line_means_connected("tun up"));
+        assert!(line_means_connected("TUN UP on hy0"));
+        assert!(line_means_connected("authenticated"));
+        assert!(line_means_connected("Authenticated to server"));
+        assert!(line_means_connected("tunnel up"));
+        assert!(line_means_connected("TUN listening"));
+        assert!(!line_means_connected("starting hy"));
+        assert!(!line_means_connected("unauthenticated"));
+        assert!(!line_means_connected("disconnected"));
+    }
+
+    #[test]
+    fn spawned_stays_starting_until_success_line_then_connected() {
+        let mut app = App::new();
+        note_spawned(&mut app, 42, false);
+        assert_eq!(app.run_phase.label(), "STARTING");
+        append_logs(&mut app, ["noise".into()]);
+        assert_eq!(app.run_phase.label(), "STARTING");
+        append_logs(&mut app, ["ready tun up".into()]);
+        assert_eq!(app.run_phase.label(), "CONNECTED");
+        assert_eq!(app.log.len(), 2);
+        note_hy_exited(&mut app);
+        assert_eq!(app.run_phase.label(), "ERROR");
+        assert_eq!(app.log.len(), 2);
+        app.log.clear();
+        assert_eq!(app.log.len(), 0);
+    }
+
+    #[test]
+    fn public_run_labels_are_the_four() {
+        for p in [
+            RunPhase::Stopped,
+            RunPhase::Starting,
+            RunPhase::Running,
+            RunPhase::Stopping,
+            RunPhase::Error,
+        ] {
+            assert!(
+                matches!(p.label(), "STOPPED" | "STARTING" | "CONNECTED" | "ERROR"),
+                "{}",
+                p.label()
+            );
+        }
+        assert_eq!(RunPhase::Running.label(), "CONNECTED");
+        assert_eq!(RunPhase::Stopping.label(), "STARTING");
+    }
+
+    #[test]
+    fn no_ui_string_contains_quic_mbps() {
+        let forbidden = format!("{} {}", "QUIC", "Mbps");
+        let forbidden_zh = format!("{} {}", "精确", "QUIC");
+        let copy = [
+            STATUS_HINT,
+            RATE_CAPTION,
+            RATE_CAPTION_ROUTE,
+            RunPhase::Stopped.label(),
+            RunPhase::Starting.label(),
+            RunPhase::Running.label(),
+            RunPhase::Error.label(),
+        ];
+        for s in copy {
+            assert!(!s.contains(&forbidden), "{s}");
+            assert!(!s.contains(&forbidden_zh), "{s}");
+        }
+        let mut app = App::new();
+        app.tab = Tab::Run;
+        app.form.route_mode = RouteMode::Url;
+        note_spawned(&mut app, 7, false);
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(!text.contains(&forbidden), "{text}");
+        assert!(!text.contains(&forbidden_zh), "{text}");
+        assert!(text.contains("TUN 出"), "{text}");
+        assert!(text.contains("—"), "{text}");
     }
 }

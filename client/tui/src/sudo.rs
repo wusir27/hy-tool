@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config_gen;
+use crate::logbuf::{self, LogTap};
 use crate::spawn::{self, PreparedStart};
 
 pub const PRESERVE_ENV: &str = "HYSTERIA_LOG_LEVEL,HYSTERIA_LOG_FORMAT";
@@ -227,6 +228,7 @@ pub struct HyProcess {
     path_prepend: Option<PathBuf>,
     extra_env: Vec<(String, String)>,
     finished: bool,
+    log_tap: LogTap,
 }
 
 impl HyProcess {
@@ -298,6 +300,10 @@ impl HyProcess {
             let _ = h.join();
         }
     }
+
+    pub fn take_log_lines(&self) -> Vec<String> {
+        self.log_tap.take()
+    }
 }
 
 impl Drop for HyProcess {
@@ -333,6 +339,7 @@ impl Drop for HyProcess {
 pub struct StartSession {
     pub process: Option<HyProcess>,
     pub password_failures: u8,
+    log_tap: LogTap,
 }
 
 impl StartSession {
@@ -349,8 +356,13 @@ impl StartSession {
     }
 
     pub fn record_child(&mut self, proc: HyProcess) {
+        self.log_tap = proc.log_tap.clone();
         self.process = Some(proc);
         self.password_failures = 0;
+    }
+
+    pub fn poll_logs(&self) -> Vec<String> {
+        self.log_tap.take()
     }
 
     pub fn note_password_failure(&mut self) {
@@ -417,13 +429,19 @@ fn run_argv(
         .with_context(|| format!("run {}", argv.join(" ")))
 }
 
-fn drain_read<R: Read + Send + 'static>(mut r: R) -> thread::JoinHandle<()> {
+fn drain_read<R: Read + Send + 'static>(mut r: R, tap: LogTap) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut partial = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
             match r.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+                Ok(0) | Err(_) => {
+                    logbuf::flush_partial(&mut partial, |s| tap.push(s));
+                    break;
+                }
+                Ok(n) => {
+                    logbuf::feed_bytes(&mut partial, &buf[..n], |s| tap.push(s));
+                }
             }
         }
     })
@@ -583,9 +601,10 @@ pub fn spawn_hy(
         }
     };
 
-    let mut drains = vec![drain_read(stdout_rest)];
+    let tap = LogTap::new();
+    let mut drains = vec![drain_read(stdout_rest, tap.clone())];
     if let Some(stderr) = child.stderr.take() {
-        drains.push(drain_read(stderr));
+        drains.push(drain_read(stderr, tap.clone()));
     }
 
     let mut proc = HyProcess {
@@ -596,6 +615,7 @@ pub fn spawn_hy(
         path_prepend: opts.path_prepend,
         extra_env: opts.extra_env,
         finished: false,
+        log_tap: tap,
     };
     thread::sleep(Duration::from_millis(30));
     if !proc.is_alive() {
@@ -1055,6 +1075,53 @@ done
         )
         .unwrap();
         assert!(!inner(&plan.argv).contains("--route"), "{:?}", plan.argv);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    const FAKE_HY_LOG: &str = r#"#!/bin/sh
+echo "hello-out tun up"
+echo "authenticated" >&2
+trap 'exit 0' INT TERM
+while true; do
+  sleep 1
+done
+"#;
+
+    #[test]
+    fn remaining_stdout_stderr_reach_log_tap_without_pid_line() {
+        let home = temp_home("log-tap");
+        write_exec(&fetch_hy::default_hy_bin(&home), FAKE_HY_LOG);
+        std::fs::create_dir_all(home.join(".hy")).unwrap();
+        let form = FormState::default();
+        std::fs::write(client_yaml_path(&home), config_gen::to_yaml(&form)).unwrap();
+        let prepared = prepare_start(&home, &form).unwrap();
+        let plan = plan_launch(
+            &home,
+            &config_gen::to_yaml(&form),
+            &prepared,
+            Privilege::Root,
+        )
+        .unwrap();
+        let mut proc = spawn_hy(&plan, None, SpawnOpts::default()).expect("root spawn");
+        let pid = proc.hy_pid.to_string();
+        let mut blob = String::new();
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(50));
+            for line in proc.take_log_lines() {
+                blob.push_str(&line);
+                blob.push('\n');
+            }
+            if blob.contains("hello-out") && blob.contains("authenticated") {
+                break;
+            }
+        }
+        assert!(blob.contains("hello-out"), "{blob}");
+        assert!(blob.contains("authenticated"), "{blob}");
+        assert!(
+            !blob.lines().any(|l| l.trim() == pid),
+            "pid line must not enter the log: {blob}"
+        );
+        proc.stop(Duration::from_secs(3)).ok();
         let _ = std::fs::remove_dir_all(&home);
     }
 }
