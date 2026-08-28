@@ -10,25 +10,37 @@
 
 ## 1. 安装 / 打开
 
-需要 **Rust 1.85+**。面向 macOS / Linux。**没有 Windows TUN**（hy 本身也不支持）。
+面向 macOS / Linux。**没有 Windows TUN**（hy 本身也不支持）。
 
-1. 克隆 hy-tool：
-
-   ```bash
-   git clone https://github.com/wusir27/hy-tool.git
-   cd hy-tool
-   ```
-
-2. 在 crate 目录运行：
+1. 安装脚本（推荐，不需要 Rust）：
 
    ```bash
-   cd client/tui
-   cargo run --release
+   bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/client/install_tui.sh)
    ```
 
-   > 或从仓库根目录安装：`cargo install --path client/tui`（二进制通常在 `~/.cargo/bin/hy-tui`）。也可以自己拷到 `~/.hy/bin/hy-tui`。没有单独的安装脚本。
+   默认写到 `~/.hy/bin/hy-tui`。可用 `HY_TUI_TAG` 指定 Release 标签，`HY_TUI_DIR` 改安装目录。
 
-3. 服务端须已按 [server.md](../server/server.md) 跑起来，版本与客户端 `hy` 一致。
+2. 或从 [Releases](https://github.com/wusir27/hy-tool/releases) 手动下载匹配本机的资产（`hy-tui-darwin-arm64` / `hy-tui-darwin-amd64` / `hy-tui-linux-amd64` / `hy-tui-linux-arm64`），放到 `~/.hy/bin/hy-tui` 并 `chmod 755`。
+
+3. 运行：
+
+   ```bash
+   ~/.hy/bin/hy-tui
+   ```
+
+   或把 `~/.hy/bin` 加进 PATH 后直接 `hy-tui`。TUN 仍需要 sudo（见第 6 节）。服务端须已按 [server.md](../server/server.md) 跑起来，版本与客户端 `hy` 一致。
+
+### 从源码编
+
+需要 **Rust 1.85+**。
+
+```bash
+git clone https://github.com/wusir27/hy-tool.git
+cd hy-tool/client/tui
+cargo run --release
+```
+
+或从仓库根目录：`cargo install --path client/tui`（二进制通常在 `~/.cargo/bin/hy-tui`）。
 
 ---
 

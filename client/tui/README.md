@@ -2,6 +2,12 @@
 
 hy-tool 里的终端启动器（ratatui），不是第二套客户端：下载官方 `hy`、写 `~/.hy/client.yaml`，再 exec `hy client`。完整用法见 **[../tui.md](../tui.md)**。
 
+日常使用请跑安装脚本（不需要 Rust）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/client/install_tui.sh)
+```
+
 ## 构建 / 运行
 
 在本目录：

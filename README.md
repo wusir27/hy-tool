@@ -13,3 +13,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/wusir27/hy-tool/main/server/
 ## 客户端
 
 见 [`client/`](client/)。下载同版本 `hy`、改 `client.yaml`、SOCKS5；macOS 系统流量见 [`macos-utun.md`](client/macos-utun.md)。
+
+TUI 见 [`client/tui.md`](client/tui.md)，安装用 [`client/install_tui.sh`](client/install_tui.sh)。
