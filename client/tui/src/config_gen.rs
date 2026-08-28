@@ -1,7 +1,9 @@
-//! Form state → hy client YAML (v0.0.2 camelCase) and atomic write to ~/.hy/client.yaml.
+//! Form state ↔ hy client YAML (v0.0.2 camelCase) and atomic write to ~/.hy/client.yaml.
 //!
 //! Field names match hy `ClientYaml` (crates/hy-app/src/config.rs). U1 never writes
 //! top-level `route.file`. Save does not need the hy binary or the network.
+//! Startup may read `~/.hy/client.yaml` into the form; a missing file stays default.
+//! Unreadable or invalid yaml returns an error and must not rewrite the file.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -19,7 +21,7 @@ pub enum RouteMode {
 }
 
 /// Config tab fields. Defaults match design §7.2 Darwin skeleton (also parses on Linux).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormState {
     pub server: String,
     pub auth: String,
@@ -150,6 +152,184 @@ pub fn to_yaml(form: &FormState) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Overlay recognized keys onto `FormState::default()`. Unknown keys are ignored.
+/// Returns an error if `yaml` is not a mapping (or does not parse).
+pub fn from_yaml(yaml: &str) -> Result<FormState> {
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).context("invalid yaml")?;
+    if !root.is_mapping() {
+        anyhow::bail!("yaml is not a mapping");
+    }
+    let mut form = FormState::default();
+    overlay_form(&mut form, &root);
+    if advanced_present(&form) {
+        form.advanced_expanded = true;
+    }
+    Ok(form)
+}
+
+/// Read `path` into a form. Missing file → `FormState::default()`.
+/// Unreadable or invalid yaml → `Err` without creating, deleting, or rewriting `path`.
+pub fn load_from_path(path: &Path) -> Result<FormState> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => from_yaml(&text).with_context(|| format!("parse {}", path.display())),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(FormState::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn overlay_form(form: &mut FormState, root: &serde_yaml::Value) {
+    if let Some(s) = root.get("server").and_then(yaml_string) {
+        apply_server(form, &s);
+    }
+    if let Some(s) = root.get("auth").and_then(yaml_string) {
+        form.auth = s;
+    }
+    if let Some(tls) = root.get("tls").filter(|v| v.is_mapping()) {
+        if let Some(s) = tls.get("sni").and_then(yaml_string) {
+            form.tls_sni = s;
+        }
+        form.verify_cert = tls.get("insecure").and_then(serde_yaml::Value::as_bool) != Some(true);
+    }
+    if let Some(tun) = root.get("tun").filter(|v| v.is_mapping()) {
+        if let Some(s) = tun.get("name").and_then(yaml_string) {
+            form.tun_name = s;
+        }
+        if let Some(s) = tun.get("timeout").and_then(yaml_string) {
+            form.timeout = s;
+        }
+        if let Some(addr) = tun.get("address").filter(|v| v.is_mapping()) {
+            if let Some(s) = addr.get("ipv4").and_then(yaml_string) {
+                form.tun_ipv4 = s;
+            }
+            if let Some(s) = addr.get("ipv6").and_then(yaml_string) {
+                form.tun_ipv6 = s;
+            }
+        }
+        if let Some(route) = tun.get("route") {
+            form.write_route = true;
+            if let Some(ex) = route.get("ipv4Exclude").and_then(first_list_string) {
+                form.ipv4_exclude = ex;
+            }
+        } else {
+            form.write_route = false;
+        }
+    }
+    if let Some(file) = root
+        .get("route")
+        .and_then(|r| r.get("file"))
+        .and_then(yaml_string)
+    {
+        let file = file.trim();
+        if !file.is_empty() {
+            form.route_mode = RouteMode::Local;
+            form.route_local_path = file.to_string();
+        }
+    }
+    if let Some(bw) = root.get("bandwidth").filter(|v| v.is_mapping()) {
+        if let Some(s) = bw.get("up").and_then(yaml_string) {
+            form.bandwidth_up = s;
+        }
+        if let Some(s) = bw.get("down").and_then(yaml_string) {
+            form.bandwidth_down = s;
+        }
+    }
+    if let Some(obfs) = root.get("obfs").filter(|v| v.is_mapping()) {
+        if let Some(s) = obfs.get("type").and_then(yaml_string) {
+            form.obfs_type = s;
+        }
+        let ty = if form.obfs_type.trim().is_empty() {
+            "salamander"
+        } else {
+            form.obfs_type.trim()
+        };
+        if let Some(pw) = obfs
+            .get(ty)
+            .and_then(|block| block.get("password"))
+            .and_then(yaml_string)
+        {
+            form.obfs_password = pw;
+        }
+    }
+    if let Some(quic) = root.get("quic").filter(|v| v.is_mapping()) {
+        if let Some(s) = quic.get("initStreamReceiveWindow").and_then(yaml_string) {
+            form.quic_init_stream_window = s;
+        }
+        if let Some(s) = quic.get("maxStreamReceiveWindow").and_then(yaml_string) {
+            form.quic_max_stream_window = s;
+        }
+        if let Some(s) = quic.get("initConnReceiveWindow").and_then(yaml_string) {
+            form.quic_init_conn_window = s;
+        }
+        if let Some(s) = quic.get("maxConnReceiveWindow").and_then(yaml_string) {
+            form.quic_max_conn_window = s;
+        }
+    }
+    if let Some(b) = root.get("lazy").and_then(serde_yaml::Value::as_bool) {
+        form.lazy = b;
+    }
+    if let Some(b) = root.get("fastOpen").and_then(serde_yaml::Value::as_bool) {
+        form.fast_open = b;
+    }
+    if let Some(s) = root
+        .get("socks5")
+        .and_then(|s| s.get("listen"))
+        .and_then(yaml_string)
+    {
+        form.socks5_listen = s;
+    }
+    if let Some(s) = root
+        .get("transport")
+        .and_then(|t| t.get("udp"))
+        .and_then(|u| u.get("hopInterval"))
+        .and_then(yaml_string)
+    {
+        form.hop_interval = s;
+    }
+}
+
+fn apply_server(form: &mut FormState, raw: &str) {
+    let raw = raw.trim();
+    if let Some((head, rest)) = raw.split_once(',') {
+        form.server = head.trim().to_string();
+        form.hop_ports = rest.trim().to_string();
+    } else {
+        form.server = raw.to_string();
+    }
+}
+
+fn advanced_present(form: &FormState) -> bool {
+    !form.bandwidth_up.trim().is_empty()
+        || !form.bandwidth_down.trim().is_empty()
+        || !form.obfs_type.trim().is_empty()
+        || !form.obfs_password.trim().is_empty()
+        || !form.hop_ports.trim().is_empty()
+        || !form.hop_interval.trim().is_empty()
+        || !form.quic_init_stream_window.trim().is_empty()
+        || !form.quic_max_stream_window.trim().is_empty()
+        || !form.quic_init_conn_window.trim().is_empty()
+        || !form.quic_max_conn_window.trim().is_empty()
+        || form.lazy
+        || form.fast_open
+        || !form.socks5_listen.trim().is_empty()
+        || !form.tun_ipv6.trim().is_empty()
+}
+
+fn yaml_string(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn first_list_string(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::Sequence(seq) => seq.first().and_then(yaml_string),
+        other => yaml_string(other),
+    }
 }
 
 fn emit_bandwidth(out: &mut String, form: &FormState) {
@@ -679,6 +859,151 @@ mod tests {
             "hy rejected generated YAML (exit {code:?}):\n{combined}\n--- yaml ---\n{yaml}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn filled_form() -> FormState {
+        let mut form = FormState::default();
+        form.server = "10.1.2.3:443".into();
+        form.auth = "hunter2".into();
+        form.tls_sni = "example.com".into();
+        form.verify_cert = true;
+        form.tun_name = "hy0".into();
+        form.tun_ipv4 = "10.0.0.2/30".into();
+        form.write_route = true;
+        form.ipv4_exclude = "10.1.2.3/32".into();
+        form.timeout = "30s".into();
+        form.advanced_expanded = true;
+        form.socks5_listen = "127.0.0.1:1080".into();
+        form.bandwidth_up = "100mbps".into();
+        form.bandwidth_down = "500mbps".into();
+        form.hop_ports = "10000-20000".into();
+        form
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("hy-tui-w1-{tag}-{nanos}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_path_and_empty_home_are_defaults() {
+        let missing = PathBuf::from("/tmp/hy-tui-w1-missing/no-such/client.yaml");
+        assert_eq!(load_from_path(&missing).unwrap(), FormState::default());
+
+        let home = scratch_dir("empty-home");
+        let path = home.join(".hy").join("client.yaml");
+        assert!(!path.exists());
+        assert_eq!(load_from_path(&path).unwrap(), FormState::default());
+        assert!(!path.exists(), "missing path must not create client.yaml");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn from_yaml_roundtrip_filled_form() {
+        let form = filled_form();
+        let loaded = from_yaml(&to_yaml(&form)).expect("from_yaml");
+        assert_eq!(loaded.server, form.server);
+        assert_eq!(loaded.auth, form.auth);
+        assert_eq!(loaded.tls_sni, form.tls_sni);
+        assert_eq!(loaded.verify_cert, form.verify_cert);
+        assert_eq!(loaded.tun_name, form.tun_name);
+        assert_eq!(loaded.tun_ipv4, form.tun_ipv4);
+        assert_eq!(loaded.write_route, form.write_route);
+        assert_eq!(loaded.ipv4_exclude, form.ipv4_exclude);
+        assert_eq!(loaded.timeout, form.timeout);
+        assert_eq!(loaded.socks5_listen, form.socks5_listen);
+        assert_eq!(loaded.bandwidth_up, form.bandwidth_up);
+        assert_eq!(loaded.bandwidth_down, form.bandwidth_down);
+        assert_eq!(loaded.hop_ports, form.hop_ports);
+        assert!(loaded.advanced_expanded);
+    }
+
+    #[test]
+    fn bad_yaml_returns_error_and_does_not_delete_fixture() {
+        assert!(from_yaml("this is garbage").is_err());
+        assert!(from_yaml("[]").is_err());
+        assert!(from_yaml("- just\n- a\n- list\n").is_err());
+
+        let dir = scratch_dir("bad-yaml");
+        let path = dir.join("client.yaml");
+        let original = "this is garbage\nnot: [ a: mapping: :\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(load_from_path(&path).is_err());
+        assert!(path.is_file(), "bad yaml must not delete the file");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "bad yaml must leave contents unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_insecure_maps_to_verify_cert() {
+        let insecure = from_yaml("tls:\n  insecure: true\n").unwrap();
+        assert!(!insecure.verify_cert);
+
+        let omitted = from_yaml("tls:\n  sni: example.com\n").unwrap();
+        assert!(omitted.verify_cert);
+        assert_eq!(omitted.tls_sni, "example.com");
+
+        let off = from_yaml("tls:\n  insecure: false\n").unwrap();
+        assert!(off.verify_cert);
+    }
+
+    #[test]
+    fn no_tun_route_sets_write_route_false() {
+        let form = from_yaml("tun:\n  name: hy0\n  timeout: 45s\n").unwrap();
+        assert!(!form.write_route);
+        assert_eq!(form.tun_name, "hy0");
+        assert_eq!(form.timeout, "45s");
+        assert_eq!(form.ipv4_exclude, FormState::default().ipv4_exclude);
+    }
+
+    #[test]
+    fn handwritten_route_file_sets_local_mode() {
+        let form = from_yaml("route:\n  file: /tmp/x.conf\n").unwrap();
+        assert_eq!(form.route_mode, RouteMode::Local);
+        assert_eq!(form.route_local_path, "/tmp/x.conf");
+        let yaml = to_yaml(&form);
+        let v = value(&yaml);
+        assert!(
+            v.get("route").is_none(),
+            "Save must not emit route.file\n{yaml}"
+        );
+        assert!(!yaml.contains("/tmp/x.conf"), "{yaml}");
+    }
+
+    #[test]
+    fn unknown_keys_ignored_known_keys_load() {
+        let yaml = r#"
+server: 10.9.8.7:443
+auth: s3cret
+madeUp: true
+tls:
+  sni: sni.example
+  pinSHA256: deadbeef
+tun:
+  name: hy0
+  mystery: 1
+  address:
+    ipv4: 10.0.0.2/30
+extraTop:
+  nested: 1
+"#;
+        let form = from_yaml(yaml).unwrap();
+        assert_eq!(form.server, "10.9.8.7:443");
+        assert_eq!(form.auth, "s3cret");
+        assert_eq!(form.tls_sni, "sni.example");
+        assert_eq!(form.tun_name, "hy0");
+        assert_eq!(form.tun_ipv4, "10.0.0.2/30");
+        assert!(!form.write_route);
     }
 
     fn is_yaml_parse_failure(msg: &str) -> bool {

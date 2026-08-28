@@ -266,6 +266,19 @@ impl App {
             started_at: None,
             saw_success: false,
         };
+        if let Ok(home) = crate::config_gen::home_dir() {
+            if !home.as_os_str().is_empty() {
+                let path = home.join(".hy").join("client.yaml");
+                match crate::config_gen::load_from_path(&path) {
+                    Ok(form) => app.form = form,
+                    Err(e) => {
+                        let msg = format!("failed to load client.yaml: {e}");
+                        let one = msg.lines().next().unwrap_or(msg.as_str());
+                        app.set_status(one, true);
+                    }
+                }
+            }
+        }
         app.sync_cursor();
         app
     }
