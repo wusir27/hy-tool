@@ -4,13 +4,17 @@
 //! top-level `route.file`. Save does not need the hy binary or the network.
 //! Startup may read `~/.hy/client.yaml` into the form; a missing file stays default.
 //! Unreadable or invalid yaml returns an error and must not rewrite the file.
+//!
+//! Route radios (off/local/url + URL + local path) are persisted separately in
+//! `~/.hy/tui.json` (0600). That file never contains auth, sudo password, or hy path.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-/// Client-route radios. U1 keeps the choice in memory only; Save must not download
+/// Client-route radios. Persist to `tui.json` on Save/Start; Save must not download
 /// or emit `route.file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RouteMode {
@@ -177,6 +181,58 @@ pub fn load_from_path(path: &Path) -> Result<FormState> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(FormState::default()),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
+}
+
+/// On-disk route cache. Only these three keys are written; unknown keys are ignored on read.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TuiJson {
+    #[serde(default)]
+    route_mode: String,
+    #[serde(default)]
+    route_url: String,
+    #[serde(default)]
+    route_local: String,
+}
+
+fn route_mode_wire(mode: RouteMode) -> &'static str {
+    match mode {
+        RouteMode::Off => "off",
+        RouteMode::Local => "local",
+        RouteMode::Url => "url",
+    }
+}
+
+fn parse_route_mode(raw: &str) -> RouteMode {
+    match raw.trim() {
+        "local" => RouteMode::Local,
+        "url" => RouteMode::Url,
+        _ => RouteMode::Off,
+    }
+}
+
+/// Overlay `routeMode` / `routeUrl` / `routeLocal` from `path` onto `form`.
+///
+/// Missing file → no-op (`Ok`). Unreadable or invalid JSON → `Err` without
+/// creating, deleting, or rewriting `path`. When the file exists, its three
+/// fields win over yaml (including handwritten `route.file`).
+pub fn overlay_tui_json(form: &mut FormState, path: &Path) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    if !value.is_object() {
+        anyhow::bail!("tui.json is not an object");
+    }
+    let parsed: TuiJson =
+        serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
+    form.route_mode = parse_route_mode(&parsed.route_mode);
+    form.route_url = parsed.route_url;
+    form.route_local_path = parsed.route_local;
+    Ok(())
 }
 
 fn overlay_form(form: &mut FormState, root: &serde_yaml::Value) {
@@ -469,7 +525,29 @@ pub async fn save_to(form: &FormState, home: &Path) -> Result<PathBuf> {
         .await
         .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
     set_mode(&dest, 0o600)?;
+    write_tui_json(form, &hy_dir).await?;
     Ok(dest)
+}
+
+/// Atomic write of `hy_dir/tui.json` (0600). Only routeMode / routeUrl / routeLocal.
+async fn write_tui_json(form: &FormState, hy_dir: &Path) -> Result<()> {
+    let body = TuiJson {
+        route_mode: route_mode_wire(form.route_mode).to_string(),
+        route_url: form.route_url.clone(),
+        route_local: form.route_local_path.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&body).context("serialize tui.json")?;
+    let dest = hy_dir.join("tui.json");
+    let tmp = hy_dir.join(format!(".tui.json.{}.tmp", std::process::id()));
+    tokio::fs::write(&tmp, &bytes)
+        .await
+        .with_context(|| format!("write {}", tmp.display()))?;
+    set_mode(&tmp, 0o600)?;
+    tokio::fs::rename(&tmp, &dest)
+        .await
+        .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
+    set_mode(&dest, 0o600)?;
+    Ok(())
 }
 
 async fn ensure_hy_dir(hy_dir: &Path) -> Result<()> {
@@ -1036,5 +1114,189 @@ extraTop:
             .arg(&dest)
             .status();
         Some(dest)
+    }
+
+    fn load_saved(home: &Path) -> FormState {
+        let mut form = load_from_path(&home.join(".hy").join("client.yaml")).unwrap();
+        overlay_tui_json(&mut form, &home.join(".hy").join("tui.json")).unwrap();
+        form
+    }
+
+    #[tokio::test]
+    async fn save_to_writes_tui_json_0600_route_keys_only() {
+        let home = scratch_dir("tui-json-shape");
+        let mut form = FormState::default();
+        form.auth = "must-not-appear-in-tui-json".into();
+        form.hy_path = "/opt/custom/hy".into();
+        form.route_mode = RouteMode::Url;
+        form.route_url = "https://example.com/rules.conf".into();
+        save_to(&form, &home).await.expect("save_to");
+
+        let yaml_path = home.join(".hy").join("client.yaml");
+        let tui_path = home.join(".hy").join("tui.json");
+        assert!(yaml_path.is_file(), "client.yaml next to tui.json");
+        assert!(tui_path.is_file());
+        let mode = std::fs::metadata(&tui_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "tui.json must be 0600");
+
+        let text = std::fs::read_to_string(&tui_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let obj = v.as_object().expect("object");
+        let mut keys: Vec<_> = obj.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["routeLocal", "routeMode", "routeUrl"],
+            "tui.json keys: {text}"
+        );
+        assert_eq!(obj.get("routeMode").and_then(|x| x.as_str()), Some("url"));
+        assert_eq!(
+            obj.get("routeUrl").and_then(|x| x.as_str()),
+            Some("https://example.com/rules.conf")
+        );
+        assert_eq!(obj.get("routeLocal").and_then(|x| x.as_str()), Some(""));
+        assert!(!text.contains("auth"), "{text}");
+        assert!(!text.contains("must-not-appear-in-tui-json"), "{text}");
+        assert!(!text.contains("/opt/custom/hy"), "{text}");
+        assert!(
+            !text.contains("hy_path") && !text.contains("hyPath"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn save_url_mode_loads_back() {
+        let home = scratch_dir("save-url");
+        let mut form = FormState::default();
+        form.route_mode = RouteMode::Url;
+        form.route_url = "https://example.com/rules.conf".into();
+        form.route_local_path.clear();
+        save_to(&form, &home).await.unwrap();
+        let loaded = load_saved(&home);
+        assert_eq!(loaded.route_mode, RouteMode::Url);
+        assert_eq!(loaded.route_url, "https://example.com/rules.conf");
+        assert_eq!(loaded.route_local_path, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn save_local_mode_loads_back() {
+        let home = scratch_dir("save-local");
+        let mut form = FormState::default();
+        form.route_mode = RouteMode::Local;
+        form.route_local_path = "/tmp/my-route.conf".into();
+        save_to(&form, &home).await.unwrap();
+        let loaded = load_saved(&home);
+        assert_eq!(loaded.route_mode, RouteMode::Local);
+        assert_eq!(loaded.route_local_path, "/tmp/my-route.conf");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn save_off_mode_loads_back() {
+        let home = scratch_dir("save-off");
+        let mut form = FormState::default();
+        form.route_mode = RouteMode::Off;
+        form.route_url.clear();
+        form.route_local_path.clear();
+        save_to(&form, &home).await.unwrap();
+        let loaded = load_saved(&home);
+        assert_eq!(loaded.route_mode, RouteMode::Off);
+        assert_eq!(loaded.route_url, "");
+        assert_eq!(loaded.route_local_path, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn yaml_route_file_without_tui_json_stays_local() {
+        let home = scratch_dir("yaml-route-no-tui");
+        let hy = home.join(".hy");
+        std::fs::create_dir_all(&hy).unwrap();
+        std::fs::write(
+            hy.join("client.yaml"),
+            "server: 10.1.2.3:443\nauth: secret\nroute:\n  file: /tmp/x.conf\n",
+        )
+        .unwrap();
+        assert!(!hy.join("tui.json").exists());
+        let mut form = load_from_path(&hy.join("client.yaml")).unwrap();
+        overlay_tui_json(&mut form, &hy.join("tui.json")).unwrap();
+        assert_eq!(form.route_mode, RouteMode::Local);
+        assert_eq!(form.route_local_path, "/tmp/x.conf");
+        assert!(
+            !hy.join("tui.json").exists(),
+            "load must not create tui.json"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tui_json_wins_over_yaml_route_file() {
+        let home = scratch_dir("tui-wins");
+        let hy = home.join(".hy");
+        std::fs::create_dir_all(&hy).unwrap();
+        std::fs::write(hy.join("client.yaml"), "route:\n  file: /tmp/x.conf\n").unwrap();
+
+        std::fs::write(
+            hy.join("tui.json"),
+            r#"{"routeMode":"off","routeUrl":"","routeLocal":""}"#,
+        )
+        .unwrap();
+        let mut form = load_from_path(&hy.join("client.yaml")).unwrap();
+        overlay_tui_json(&mut form, &hy.join("tui.json")).unwrap();
+        assert_eq!(form.route_mode, RouteMode::Off);
+        assert_eq!(form.route_local_path, "");
+
+        std::fs::write(
+            hy.join("tui.json"),
+            r#"{"routeMode":"url","routeUrl":"https://example.com/rules.conf","routeLocal":""}"#,
+        )
+        .unwrap();
+        let mut form = load_from_path(&hy.join("client.yaml")).unwrap();
+        overlay_tui_json(&mut form, &hy.join("tui.json")).unwrap();
+        assert_eq!(form.route_mode, RouteMode::Url);
+        assert_eq!(form.route_url, "https://example.com/rules.conf");
+        assert_eq!(form.route_local_path, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn bad_tui_json_returns_error_and_leaves_bytes() {
+        let home = scratch_dir("bad-tui");
+        let hy = home.join(".hy");
+        std::fs::create_dir_all(&hy).unwrap();
+        let path = hy.join("tui.json");
+        for original in ["this is garbage\n", "[]\n", "\"not-an-object\"\n"] {
+            std::fs::write(&path, original).unwrap();
+            let mut form = FormState::default();
+            form.route_mode = RouteMode::Local;
+            form.route_local_path = "/keep-me.conf".into();
+            assert!(overlay_tui_json(&mut form, &path).is_err(), "{original:?}");
+            assert!(path.is_file(), "bad tui.json must not be deleted");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "bad tui.json must leave contents unchanged"
+            );
+            assert_eq!(form.route_mode, RouteMode::Local);
+            assert_eq!(form.route_local_path, "/keep-me.conf");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_only_does_not_create_tui_json() {
+        let home = scratch_dir("load-only");
+        let yaml = home.join(".hy").join("client.yaml");
+        let tui = home.join(".hy").join("tui.json");
+        assert!(!yaml.exists());
+        assert!(!tui.exists());
+        let mut form = load_from_path(&yaml).unwrap();
+        overlay_tui_json(&mut form, &tui).unwrap();
+        assert_eq!(form, FormState::default());
+        assert!(!yaml.exists(), "load must not create client.yaml");
+        assert!(!tui.exists(), "load must not create tui.json");
+        assert!(!home.join(".hy").exists(), "load must not create .hy");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

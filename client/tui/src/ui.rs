@@ -268,14 +268,21 @@ impl App {
         };
         if let Ok(home) = crate::config_gen::home_dir() {
             if !home.as_os_str().is_empty() {
-                let path = home.join(".hy").join("client.yaml");
-                match crate::config_gen::load_from_path(&path) {
+                let hy_dir = home.join(".hy");
+                match crate::config_gen::load_from_path(&hy_dir.join("client.yaml")) {
                     Ok(form) => app.form = form,
                     Err(e) => {
                         let msg = format!("failed to load client.yaml: {e}");
                         let one = msg.lines().next().unwrap_or(msg.as_str());
                         app.set_status(one, true);
                     }
+                }
+                if let Err(e) =
+                    crate::config_gen::overlay_tui_json(&mut app.form, &hy_dir.join("tui.json"))
+                {
+                    let msg = format!("failed to load tui.json: {e}");
+                    let one = msg.lines().next().unwrap_or(msg.as_str());
+                    app.set_status(one, true);
                 }
             }
         }
