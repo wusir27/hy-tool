@@ -22,6 +22,7 @@ pub const LOG_LEVEL: &str = "info";
 pub const LOG_FORMAT: &str = "console";
 pub const PASSWORD_PROMPT: &str = "系统密码，给 sudo 用一次";
 pub const NO_TTY_MSG: &str = "在 Terminal 里跑 hy-tui";
+pub const STILL_RUNNING_MSG: &str = "hy 可能还在运行";
 pub const MAX_PASSWORD_FAILS: u8 = 3;
 pub const STOP_WAIT: Duration = Duration::from_secs(8);
 const PID_WAIT: Duration = Duration::from_secs(5);
@@ -168,6 +169,16 @@ pub fn term_argv(pid: u32, via_sudo: bool) -> Vec<String> {
     kill_argv(pid, via_sudo, "-TERM")
 }
 
+/// `sudo -S -p '' kill -INT <pid>` after `-n` fails and the user typed a password.
+pub fn stop_s_argv(pid: u32) -> Vec<String> {
+    kill_s_argv(pid, "-INT")
+}
+
+/// `sudo -S -p '' kill -TERM <pid>` after `-n` TERM fails.
+pub fn term_s_argv(pid: u32) -> Vec<String> {
+    kill_s_argv(pid, "-TERM")
+}
+
 fn kill_argv(pid: u32, via_sudo: bool, sig: &str) -> Vec<String> {
     if via_sudo {
         vec![
@@ -180,6 +191,26 @@ fn kill_argv(pid: u32, via_sudo: bool, sig: &str) -> Vec<String> {
     } else {
         vec!["kill".into(), sig.into(), pid.to_string()]
     }
+}
+
+fn kill_s_argv(pid: u32, sig: &str) -> Vec<String> {
+    vec![
+        "sudo".into(),
+        "-S".into(),
+        "-p".into(),
+        String::new(),
+        "kill".into(),
+        sig.into(),
+        pid.to_string(),
+    ]
+}
+
+/// Stop / Restart outcome. `NeedsPassword` / `PasswordRejected` mean hy is still up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopResult {
+    Exited,
+    NeedsPassword,
+    PasswordRejected,
 }
 
 #[derive(Debug, Clone)]
@@ -271,28 +302,142 @@ impl HyProcess {
         }
     }
 
+    fn kill_n(&self, argv: &[String]) -> bool {
+        run_argv(argv, self.path_prepend.as_deref(), &self.extra_env)
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn kill_s(&self, argv: &[String], password: &str) -> bool {
+        run_argv_with_stdin(
+            argv,
+            self.path_prepend.as_deref(),
+            &self.extra_env,
+            Some(password),
+        )
+        .map(|s| s.success())
+        .unwrap_or(false)
+    }
+
+    fn note_maybe_still_running(&self) {
+        self.log_tap.push(STILL_RUNNING_MSG.to_string());
+    }
+
+    fn detach_child(&mut self) {
+        if let Some(child) = self.child.take() {
+            std::mem::forget(child);
+        }
+        self.finished = true;
+    }
+
     /// SIGINT, wait, then SIGTERM. Never SIGKILL.
-    pub fn stop(&mut self, timeout: Duration) -> Result<()> {
+    ///
+    /// Tries `stop_argv` / `term_argv` (`-n` or direct `kill`) first. If `via_sudo`
+    /// and the process is still alive: without a password, returns `NeedsPassword`
+    /// so the TUI can prompt (session stays not STOPPED). With a password, feeds
+    /// stdin to `stop_s_argv` / `term_s_argv` (`sudo -S -p ''`).
+    pub fn stop(
+        &mut self,
+        timeout: Duration,
+        mut password: Option<Zeroizing<String>>,
+    ) -> Result<StopResult> {
+        let pw = password.as_deref().map(|s| s.as_str());
+        let result = self.stop_inner(timeout, pw);
+        if let Some(ref mut p) = password {
+            Zeroize::zeroize(p);
+        }
+        drop(password);
+        result
+    }
+
+    fn stop_inner(&mut self, timeout: Duration, password: Option<&str>) -> Result<StopResult> {
         if self.finished {
-            return Ok(());
+            return Ok(StopResult::Exited);
         }
-        let _ = run_argv(
-            &stop_argv(self.hy_pid, self.via_sudo),
-            self.path_prepend.as_deref(),
-            &self.extra_env,
-        );
-        if self.wait_timeout(timeout)? {
-            return Ok(());
+
+        let n_int_ok = self.kill_n(&stop_argv(self.hy_pid, self.via_sudo));
+        if n_int_ok {
+            if self.wait_timeout(timeout)? {
+                return Ok(StopResult::Exited);
+            }
+        } else if !self.is_alive() {
+            return Ok(StopResult::Exited);
         }
-        let _ = run_argv(
-            &term_argv(self.hy_pid, self.via_sudo),
-            self.path_prepend.as_deref(),
-            &self.extra_env,
-        );
-        if self.wait_timeout(timeout)? {
-            return Ok(());
+
+        if self.via_sudo {
+            match password {
+                None => return Ok(StopResult::NeedsPassword),
+                Some(pw) => {
+                    let s_ok = self.kill_s(&stop_s_argv(self.hy_pid), pw);
+                    if !s_ok {
+                        if !self.is_alive() {
+                            return Ok(StopResult::Exited);
+                        }
+                        return Ok(StopResult::PasswordRejected);
+                    }
+                    if self.wait_timeout(timeout)? {
+                        return Ok(StopResult::Exited);
+                    }
+                }
+            }
+        }
+
+        let n_term_ok = self.kill_n(&term_argv(self.hy_pid, self.via_sudo));
+        if n_term_ok {
+            if self.wait_timeout(timeout)? {
+                return Ok(StopResult::Exited);
+            }
+        } else if !self.is_alive() {
+            return Ok(StopResult::Exited);
+        }
+
+        if self.via_sudo {
+            match password {
+                None => return Ok(StopResult::NeedsPassword),
+                Some(pw) => {
+                    let s_ok = self.kill_s(&term_s_argv(self.hy_pid), pw);
+                    if !s_ok {
+                        if !self.is_alive() {
+                            return Ok(StopResult::Exited);
+                        }
+                        return Ok(StopResult::PasswordRejected);
+                    }
+                    if self.wait_timeout(timeout)? {
+                        return Ok(StopResult::Exited);
+                    }
+                }
+            }
+        }
+
+        if !self.is_alive() {
+            return Ok(StopResult::Exited);
         }
         bail!("hy pid {} did not exit after SIGINT/SIGTERM", self.hy_pid)
+    }
+
+    /// Drop / Quit: `-n` (or direct kill) only. Never prompts, never `-S`, never SIGKILL.
+    /// Returns true if hy may still be running.
+    pub fn stop_n_only(&mut self, timeout: Duration) -> bool {
+        if self.finished {
+            return false;
+        }
+        let _ = self.kill_n(&stop_argv(self.hy_pid, self.via_sudo));
+        if self.wait_timeout(timeout).unwrap_or(false) {
+            return false;
+        }
+        if !self.is_alive() {
+            return false;
+        }
+        let _ = self.kill_n(&term_argv(self.hy_pid, self.via_sudo));
+        if self.wait_timeout(timeout).unwrap_or(false) {
+            return false;
+        }
+        if self.finished || !self.is_alive() {
+            return false;
+        }
+        self.note_maybe_still_running();
+        self.detach_child();
+        true
     }
 
     fn join_drains(&mut self) {
@@ -311,27 +456,8 @@ impl Drop for HyProcess {
         if self.finished {
             return;
         }
-        let _ = run_argv(
-            &stop_argv(self.hy_pid, self.via_sudo),
-            self.path_prepend.as_deref(),
-            &self.extra_env,
-        );
-        let _ = self.wait_timeout(Duration::from_secs(1));
-        if self.finished {
-            return;
-        }
-        let _ = run_argv(
-            &term_argv(self.hy_pid, self.via_sudo),
-            self.path_prepend.as_deref(),
-            &self.extra_env,
-        );
-        let _ = self.wait_timeout(Duration::from_secs(1));
-        if !self.finished {
-            // Do not SIGKILL. Detach so Drop does not block the TUI.
-            if let Some(child) = self.child.take() {
-                std::mem::forget(child);
-            }
-        }
+        // `-n` only. Never prompt, never `-S`, never SIGKILL.
+        let _ = self.stop_n_only(Duration::from_secs(1));
     }
 }
 
@@ -370,6 +496,11 @@ impl StartSession {
         self.password_failures = self.password_failures.saturating_add(1);
     }
 
+    /// Stop password was wrong; hy must stay in `process` (not STOPPED).
+    pub fn note_stop_password_failure(&mut self) {
+        self.password_failures = self.password_failures.saturating_add(1);
+    }
+
     pub fn cancel(&mut self) {
         self.process = None;
     }
@@ -378,11 +509,12 @@ impl StartSession {
         self.password_failures >= MAX_PASSWORD_FAILS
     }
 
-    pub fn stop(&mut self) -> Result<()> {
-        if let Some(mut proc) = self.process.take() {
-            proc.stop(STOP_WAIT)?;
-        }
-        Ok(())
+    /// Quit: `-n` only, never `-S`, never prompt. True if hy may still be running.
+    pub fn quit(&mut self) -> bool {
+        let Some(mut proc) = self.process.take() else {
+            return false;
+        };
+        proc.stop_n_only(Duration::from_secs(1))
     }
 }
 
@@ -415,6 +547,15 @@ fn run_argv(
     path_prepend: Option<&Path>,
     extra_env: &[(String, String)],
 ) -> Result<std::process::ExitStatus> {
+    run_argv_with_stdin(argv, path_prepend, extra_env, None)
+}
+
+fn run_argv_with_stdin(
+    argv: &[String],
+    path_prepend: Option<&Path>,
+    extra_env: &[(String, String)],
+    stdin_data: Option<&str>,
+) -> Result<std::process::ExitStatus> {
     if argv.is_empty() {
         bail!("empty argv");
     }
@@ -422,11 +563,27 @@ fn run_argv(
     let mut cmd = Command::new(&bin);
     cmd.args(&argv[1..]);
     apply_path_and_env(&mut cmd, path_prepend, extra_env);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("run {}", argv.join(" ")))
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("run {}", argv.join(" ")))?;
+    if let Some(data) = stdin_data {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(data.as_bytes());
+            if !data.ends_with('\n') {
+                let _ = stdin.write_all(b"\n");
+            }
+            let _ = stdin.flush();
+        }
+    }
+    child
+        .wait()
+        .with_context(|| format!("wait {}", argv.join(" ")))
 }
 
 fn drain_read<R: Read + Send + 'static>(mut r: R, tap: LogTap) -> thread::JoinHandle<()> {
@@ -698,24 +855,44 @@ mod tests {
     }
 
     const FAKE_SUDO: &str = r#"#!/bin/sh
+if [ -n "${HY_TUI_FAKE_SUDO_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "${HY_TUI_FAKE_SUDO_LOG}"
+fi
 need_s=0
+has_n=0
+has_kill=0
 for a in "$@"; do
   if [ "$a" = "-S" ]; then
     need_s=1
   fi
+  if [ "$a" = "-n" ]; then
+    has_n=1
+  fi
+  if [ "$a" = "kill" ]; then
+    has_kill=1
+  fi
 done
 if [ "$need_s" = 1 ]; then
   IFS= read -r _pw || true
-  unset _pw
   if [ "${HY_TUI_FAKE_BAD_PASS:-0}" = 1 ]; then
+    unset _pw
     echo "sudo: 3 incorrect password attempts" >&2
     exit 1
   fi
+  if [ -n "${HY_TUI_FAKE_PASS:-}" ] && [ "$_pw" != "${HY_TUI_FAKE_PASS}" ]; then
+    unset _pw
+    echo "sudo: 3 incorrect password attempts" >&2
+    exit 1
+  fi
+  unset _pw
 fi
 if [ "$1" = "-n" ] && [ "$2" = "true" ] && [ $# -eq 2 ]; then
   if [ "${HY_TUI_FAKE_N_TRUE:-0}" = 1 ]; then
     exit 0
   fi
+  exit 1
+fi
+if [ "$has_n" = 1 ] && [ "$has_kill" = 1 ] && [ "${HY_TUI_FAKE_N_KILL_FAIL:-0}" = 1 ]; then
   exit 1
 fi
 while [ $# -gt 0 ]; do
@@ -953,6 +1130,27 @@ done
         );
         assert!(!has_sigkill(&t), "{t:?}");
         assert!(!t.iter().any(|s| s == "-INT"));
+        let sa = stop_s_argv(4242);
+        assert_eq!(
+            sa,
+            vec!["sudo", "-S", "-p", "", "kill", "-INT", "4242"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(!has_sigkill(&sa), "{sa:?}");
+        let st = term_s_argv(9);
+        assert_eq!(
+            st,
+            vec!["sudo", "-S", "-p", "", "kill", "-TERM", "9"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(!has_sigkill(&st), "{st:?}");
+        assert!(!st.iter().any(|s| s == "-INT"));
+        assert!(!st.iter().any(|s| s == "-n"));
+        assert!(!sa.iter().any(|s| s == "-n"));
     }
 
     #[test]
@@ -1013,7 +1211,7 @@ done
             }
         }
 
-        proc.stop(Duration::from_secs(3)).ok();
+        proc.stop(Duration::from_secs(3), None).ok();
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1121,7 +1319,244 @@ done
             !blob.lines().any(|l| l.trim() == pid),
             "pid line must not enter the log: {blob}"
         );
-        proc.stop(Duration::from_secs(3)).ok();
+        proc.stop(Duration::from_secs(3), None).ok();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn reap_pid(pid: u32) {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+
+    fn log_mentions_s(body: &str) -> bool {
+        body.split_whitespace().any(|t| t == "-S")
+    }
+
+    fn spawn_via_sudo_hy(
+        tag: &str,
+        spawn_pw: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> (PathBuf, HyProcess) {
+        let home = temp_home(tag);
+        install_fake_hy(&home);
+        let fake_bin = install_fake_sudo(&home);
+        std::fs::create_dir_all(home.join(".hy")).unwrap();
+        let form = FormState::default();
+        std::fs::write(client_yaml_path(&home), config_gen::to_yaml(&form)).unwrap();
+        let prepared = prepare_start(&home, &form).unwrap();
+        let plan = plan_launch(
+            &home,
+            &config_gen::to_yaml(&form),
+            &prepared,
+            Privilege::NeedPassword,
+        )
+        .unwrap();
+        assert!(plan.via_sudo);
+        let log_to_clear = extra_env
+            .iter()
+            .find(|(k, _)| k == "HY_TUI_FAKE_SUDO_LOG")
+            .map(|(_, v)| PathBuf::from(v));
+        let proc = spawn_hy(
+            &plan,
+            Some(Zeroizing::new(spawn_pw.to_string())),
+            SpawnOpts {
+                path_prepend: Some(fake_bin),
+                extra_env,
+            },
+        )
+        .expect("mocked -S start");
+        if let Some(p) = log_to_clear {
+            let _ = std::fs::write(p, "");
+        }
+        (home, proc)
+    }
+
+    #[test]
+    fn stop_n_fail_then_s_with_password_kills_child() {
+        let log_path = std::env::temp_dir().join(format!(
+            "hy-tui-sudo-log-s-ok-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let secret = "uniq-stop-pw-Y1-ok";
+        let (home, mut proc) = spawn_via_sudo_hy(
+            "stop-s-ok",
+            secret,
+            vec![
+                ("HY_TUI_FAKE_N_KILL_FAIL".into(), "1".into()),
+                ("HY_TUI_FAKE_PASS".into(), secret.into()),
+                (
+                    "HY_TUI_FAKE_SUDO_LOG".into(),
+                    log_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        );
+        assert!(proc.via_sudo);
+        assert!(proc.is_alive());
+        let none = proc
+            .stop(Duration::from_secs(2), None)
+            .expect("stop without password");
+        assert_eq!(none, StopResult::NeedsPassword);
+        assert!(proc.is_alive(), "hy must stay up until -S");
+        let before_s = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !log_mentions_s(&before_s),
+            "NeedsPassword path must not call -S: {before_s}"
+        );
+        let got = proc
+            .stop(
+                Duration::from_secs(3),
+                Some(Zeroizing::new(secret.to_string())),
+            )
+            .expect("stop with password");
+        assert_eq!(got, StopResult::Exited);
+        assert!(!proc.is_alive());
+        let after = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(log_mentions_s(&after), "correct password must use -S: {after}");
+        assert!(!has_sigkill(
+            &after
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn three_wrong_stop_passwords_keep_child_and_session_not_stopped() {
+        let secret = "uniq-stop-pw-Y1-good";
+        let (home, proc) = spawn_via_sudo_hy(
+            "stop-bad-pw",
+            secret,
+            vec![
+                ("HY_TUI_FAKE_N_KILL_FAIL".into(), "1".into()),
+                ("HY_TUI_FAKE_PASS".into(), secret.into()),
+            ],
+        );
+        let pid = proc.hy_pid;
+        let mut session = StartSession::new();
+        session.record_child(proc);
+        for _ in 0..MAX_PASSWORD_FAILS {
+            let result = session
+                .process
+                .as_mut()
+                .unwrap()
+                .stop(
+                    Duration::from_secs(2),
+                    Some(Zeroizing::new("wrong-stop-password".into())),
+                )
+                .expect("wrong password is not a hard error");
+            assert_eq!(result, StopResult::PasswordRejected);
+            session.note_stop_password_failure();
+            assert!(session.has_child());
+            assert!(session.process.as_mut().unwrap().is_alive());
+        }
+        assert!(session.password_locked_out());
+        assert!(session.has_child());
+        assert!(session.process.as_mut().unwrap().is_alive());
+        reap_pid(pid);
+        let _ = session.quit();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn via_sudo_false_stop_argv_has_no_sudo_and_stop_does_not_call_sudo() {
+        let log_path = std::env::temp_dir().join(format!(
+            "hy-tui-sudo-log-root-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let home = temp_home("stop-root");
+        install_fake_hy(&home);
+        let fake_bin = install_fake_sudo(&home);
+        std::fs::create_dir_all(home.join(".hy")).unwrap();
+        let form = FormState::default();
+        std::fs::write(client_yaml_path(&home), config_gen::to_yaml(&form)).unwrap();
+        let prepared = prepare_start(&home, &form).unwrap();
+        let plan = plan_launch(
+            &home,
+            &config_gen::to_yaml(&form),
+            &prepared,
+            Privilege::Root,
+        )
+        .unwrap();
+        assert!(!plan.via_sudo);
+        let mut proc = spawn_hy(
+            &plan,
+            None,
+            SpawnOpts {
+                path_prepend: Some(fake_bin),
+                extra_env: vec![(
+                    "HY_TUI_FAKE_SUDO_LOG".into(),
+                    log_path.to_string_lossy().into_owned(),
+                )],
+            },
+        )
+        .expect("root spawn");
+        assert!(!proc.via_sudo);
+        let a = stop_argv(proc.hy_pid, false);
+        assert!(!a.iter().any(|s| s == "sudo"), "{a:?}");
+        assert_eq!(&a[0], "kill");
+        let t = term_argv(proc.hy_pid, false);
+        assert!(!t.iter().any(|s| s == "sudo"), "{t:?}");
+        let got = proc
+            .stop(Duration::from_secs(3), None)
+            .expect("direct kill");
+        assert_eq!(got, StopResult::Exited);
+        assert!(!proc.is_alive());
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.is_empty(),
+            "via_sudo false must not invoke sudo: {log}"
+        );
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn drop_and_quit_do_not_call_sudo_s() {
+        let log_path = std::env::temp_dir().join(format!(
+            "hy-tui-sudo-log-drop-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let secret = "uniq-stop-pw-Y1-drop";
+        let extra = vec![
+            ("HY_TUI_FAKE_N_KILL_FAIL".into(), "1".into()),
+            ("HY_TUI_FAKE_PASS".into(), secret.into()),
+            (
+                "HY_TUI_FAKE_SUDO_LOG".into(),
+                log_path.to_string_lossy().into_owned(),
+            ),
+        ];
+        let (home, proc) = spawn_via_sudo_hy("stop-drop", secret, extra.clone());
+        let pid = proc.hy_pid;
+        drop(proc);
+        let drop_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !log_mentions_s(&drop_log),
+            "Drop must not call -S: {drop_log}"
+        );
+        reap_pid(pid);
+        let _ = std::fs::remove_file(&log_path);
+
+        let (home2, proc2) = spawn_via_sudo_hy("stop-quit", secret, extra);
+        let pid2 = proc2.hy_pid;
+        let mut session = StartSession::new();
+        session.record_child(proc2);
+        let still = session.quit();
+        assert!(still, " -n fails so quit should report still running");
+        let quit_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !log_mentions_s(&quit_log),
+            "Quit must not call -S: {quit_log}"
+        );
+        assert!(!session.has_child());
+        reap_pid(pid2);
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&home2);
     }
 }

@@ -627,6 +627,50 @@ pub fn note_password_fail(app: &mut App, failures: u8, locked: bool) {
     }
 }
 
+/// hy is still running: do not mark STOPPED (Stop / Restart password path).
+pub fn restore_run_if_alive(app: &mut App) {
+    if app.hy_pid.is_some() {
+        app.run_phase = if app.saw_success {
+            RunPhase::Running
+        } else {
+            RunPhase::Starting
+        };
+    }
+}
+
+pub fn note_stop_password_cancel(app: &mut App) {
+    app.tab = Tab::Run;
+    app.focus = Focus::Stop;
+    restore_run_if_alive(app);
+    app.set_status("已取消停止", false);
+}
+
+pub fn note_stop_password_fail(app: &mut App, failures: u8, locked: bool) {
+    restore_run_if_alive(app);
+    if locked {
+        app.set_status("sudo 密码错误三次，hy 仍在运行", true);
+    } else {
+        app.begin_password_prompt(failures);
+        app.set_status(
+            format!(
+                "sudo 密码错误（{failures}/{}），请重试",
+                sudo::MAX_PASSWORD_FAILS
+            ),
+            true,
+        );
+    }
+}
+
+pub fn note_stop_no_tty(app: &mut App) {
+    restore_run_if_alive(app);
+    app.set_status(sudo::NO_TTY_MSG, true);
+}
+
+pub fn note_quit_hy_maybe_running(app: &mut App) {
+    app.log.push(sudo::STILL_RUNNING_MSG.to_string());
+    app.set_status(sudo::STILL_RUNNING_MSG, true);
+}
+
 pub fn note_spawned(app: &mut App, pid: u32, ruleset_warning: bool) {
     app.tab = Tab::Run;
     app.focus = Focus::Stop;
@@ -1327,5 +1371,28 @@ mod tests {
         assert!(!text.contains(&forbidden_zh), "{text}");
         assert!(text.contains("TUN 出"), "{text}");
         assert!(text.contains("—"), "{text}");
+    }
+
+    #[test]
+    fn stop_password_lockout_does_not_mark_stopped() {
+        let mut app = App::new();
+        note_spawned(&mut app, 99, false);
+        append_logs(&mut app, ["tun up".into()]);
+        assert_eq!(app.run_phase, RunPhase::Running);
+        note_stopping(&mut app);
+        note_stop_password_fail(&mut app, sudo::MAX_PASSWORD_FAILS, true);
+        assert_ne!(app.run_phase, RunPhase::Stopped);
+        assert_eq!(app.run_phase, RunPhase::Running);
+        assert_eq!(app.hy_pid, Some(99));
+        assert!(app.status_error);
+        assert!(app.status.contains("仍在运行"), "{}", app.status);
+
+        let mut app2 = App::new();
+        note_spawned(&mut app2, 7, false);
+        append_logs(&mut app2, ["tun up".into()]);
+        note_stop_password_cancel(&mut app2);
+        assert_ne!(app2.run_phase, RunPhase::Stopped);
+        assert_eq!(app2.run_phase, RunPhase::Running);
+        assert_eq!(app2.hy_pid, Some(7));
     }
 }

@@ -142,7 +142,7 @@ Run 顶栏：`status` / `server` / `tun` / `pid` / `uptime`。下面是 **TUN �
 
 ## 8. Stop
 
-Run 底栏 **Stop** = 对 hy 的 pid 发 **SIGINT**（与 USAGE 的 Ctrl+C 相同），超时再 **SIGTERM**。常规路径不用 SIGKILL。需要提权结束 root 的 hy 时走 `sudo -n kill`（timestamp 通常还在）。
+Run 底栏 **Stop** = 对 hy 的 pid 发 **SIGINT**（与 USAGE 的 Ctrl+C 相同），超时再 **SIGTERM**。常规路径不用 SIGKILL。需要提权结束 root 的 hy 时先 `sudo -n kill`；若 timestamp 已过，弹出和 Start 同一套密码框，再 `sudo -S kill`。仍不用 SIGKILL。
 
 > Stop 之后 tun / utun 应消失（Linux：`ip link`；macOS：`ifconfig <name>`）。创建失败时 hy 会报错退出，不留半残网卡。ICMP / ping **不会**走隧道，不要用 ping 判断是否通。
 
