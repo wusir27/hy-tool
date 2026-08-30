@@ -80,7 +80,7 @@ Config 分组：**连接** / **TUN** / **路由** / **高级**（默认折叠）
 
 ## 4. ipv4Exclude（开路由前必改）
 
-打开 **write route:**（要装默认路由 / 拆开的默认路由）之前，把 `ipv4Exclude` 改成**真实服务器公网 IP/32**，也就是本机连 `server:` 用的那张公网地址。
+打开 **write route:**（要装默认路由 / 拆开的默认路由）之前，把 `ipv4Exclude` 改成**真实服务器公网 IP/32**，也就是本机连 `server:` 用的那张公网地址。开时 Save 写出 `tun.route.ipv4: [0.0.0.0/0]` 和 exclude，不写 `::/0`。
 
 > 默认占位 `YOUR_SERVER_PUBLIC_IP/32` **不能**拿去装默认路由。hy **不会**自动填 exclude。漏了或填内网 IP，会把连服务器的包再送进隧道，形成环路。TUI 不替你解析公网 IP。
 

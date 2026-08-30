@@ -149,7 +149,11 @@ pub fn to_yaml(form: &FormState) -> String {
         }
     }
     if form.write_route {
+        // Explicit default route (hy Darwin: only 0.0.0.0/0 installs true default).
+        // Not a form field; Save always re-emits this list. Never write ::/0.
         out.push_str("  route:\n");
+        out.push_str("    ipv4:\n");
+        out.push_str("      - 0.0.0.0/0\n");
         out.push_str("    ipv4Exclude:\n");
         out.push_str("      - ");
         out.push_str(&yaml_scalar(form.ipv4_exclude.trim()));
@@ -635,7 +639,44 @@ mod tests {
     #[derive(Debug, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct TunRouteShape {
+        ipv4: Option<Vec<String>>,
         ipv4_exclude: Option<Vec<String>>,
+    }
+
+    fn tun_route(yaml: &str) -> serde_yaml::Value {
+        value(yaml)
+            .get("tun")
+            .and_then(|t| t.get("route"))
+            .cloned()
+            .expect("tun.route")
+    }
+
+    fn assert_write_route_yaml(yaml: &str, exclude: &str) {
+        let route = tun_route(yaml);
+        let ipv4 = route
+            .get("ipv4")
+            .and_then(|x| x.as_sequence())
+            .expect("tun.route.ipv4 list");
+        assert_eq!(
+            ipv4.first().and_then(|x| x.as_str()),
+            Some("0.0.0.0/0"),
+            "first tun.route.ipv4 must be 0.0.0.0/0\n{yaml}"
+        );
+        assert_eq!(
+            ipv4.len(),
+            1,
+            "tun.route.ipv4 must be only 0.0.0.0/0\n{yaml}"
+        );
+        let exclude_list = route
+            .get("ipv4Exclude")
+            .and_then(|x| x.as_sequence())
+            .expect("ipv4Exclude list");
+        assert_eq!(exclude_list[0].as_str(), Some(exclude));
+        assert!(
+            !yaml.contains("::/0"),
+            "must not write IPv6 default ::/0\n{yaml}"
+        );
+        assert!(route.get("ipv6").is_none(), "no tun.route.ipv6\n{yaml}");
     }
 
     fn parse(yaml: &str) -> ClientShape {
@@ -689,14 +730,28 @@ mod tests {
                 .and_then(|x| x.as_str()),
             Some("100.100.100.101/30")
         );
-        let exclude = tun
-            .get("route")
-            .and_then(|r| r.get("ipv4Exclude"))
-            .and_then(|x| x.as_sequence())
-            .expect("ipv4Exclude list");
-        assert_eq!(exclude[0].as_str(), Some("YOUR_SERVER_PUBLIC_IP/32"));
+        assert_write_route_yaml(&yaml, "YOUR_SERVER_PUBLIC_IP/32");
         assert!(tun.get("address").and_then(|a| a.get("ipv6")).is_none());
         assert!(v.get("socks5").is_none());
+    }
+
+    #[test]
+    fn write_route_on_emits_default_ipv4_and_exclude() {
+        let mut form = FormState::default();
+        form.write_route = true;
+        form.ipv4_exclude = "203.0.113.1/32".into();
+        let yaml = to_yaml(&form);
+        assert_write_route_yaml(&yaml, "203.0.113.1/32");
+        assert!(
+            yaml.contains("ipv4Exclude"),
+            "must emit camelCase ipv4Exclude\n{yaml}"
+        );
+        let ipv4_pos = yaml.find("    ipv4:\n").expect("tun.route.ipv4 key");
+        let exclude_pos = yaml.find("    ipv4Exclude:").expect("ipv4Exclude");
+        assert!(
+            ipv4_pos < exclude_pos,
+            "tun.route.ipv4 must come before ipv4Exclude\n{yaml}"
+        );
     }
 
     #[test]
@@ -714,6 +769,11 @@ mod tests {
             !yaml.contains("route:"),
             "no route: key when write_route is off\n{yaml}"
         );
+        assert!(
+            !yaml.contains("0.0.0.0/0"),
+            "off must not emit 0.0.0.0/0\n{yaml}"
+        );
+        assert!(!yaml.contains("ipv4Exclude"), "{yaml}");
         assert!(yaml.contains("name:"), "{yaml}");
         assert!(yaml.contains("ipv4:"), "{yaml}");
     }
@@ -752,14 +812,17 @@ mod tests {
             tun.address.as_ref().and_then(|a| a.ipv4.as_deref()),
             Some("100.100.100.101/30")
         );
+        let route = tun.route.as_ref().expect("tun.route");
         assert_eq!(
-            tun.route
-                .as_ref()
-                .and_then(|r| r.ipv4_exclude.clone())
-                .unwrap(),
+            route.ipv4.as_deref(),
+            Some(["0.0.0.0/0".to_string()].as_slice())
+        );
+        assert_eq!(
+            route.ipv4_exclude.clone().unwrap(),
             vec!["YOUR_SERVER_PUBLIC_IP/32".to_string()]
         );
         assert!(shape.route.is_none());
+        assert_write_route_yaml(&yaml, "YOUR_SERVER_PUBLIC_IP/32");
 
         let v = value(&yaml);
         assert!(
@@ -1000,6 +1063,26 @@ mod tests {
         assert_eq!(loaded.bandwidth_down, form.bandwidth_down);
         assert_eq!(loaded.hop_ports, form.hop_ports);
         assert!(loaded.advanced_expanded);
+        assert_write_route_yaml(&to_yaml(&loaded), "10.1.2.3/32");
+    }
+
+    #[test]
+    fn from_yaml_to_yaml_reemits_default_ipv4() {
+        let yaml = to_yaml(&FormState::default());
+        assert_write_route_yaml(&yaml, "YOUR_SERVER_PUBLIC_IP/32");
+        let loaded = from_yaml(&yaml).expect("from_yaml");
+        assert!(loaded.write_route);
+        assert_eq!(loaded.ipv4_exclude, "YOUR_SERVER_PUBLIC_IP/32");
+        let again = to_yaml(&loaded);
+        assert_write_route_yaml(&again, "YOUR_SERVER_PUBLIC_IP/32");
+
+        // Old on-disk yaml with only ipv4Exclude still turns write_route on
+        // and Save hardcodes 0.0.0.0/0 again (no form field for it).
+        let old = "tun:\n  route:\n    ipv4Exclude:\n      - 198.51.100.1/32\n";
+        let from_old = from_yaml(old).unwrap();
+        assert!(from_old.write_route);
+        assert_eq!(from_old.ipv4_exclude, "198.51.100.1/32");
+        assert_write_route_yaml(&to_yaml(&from_old), "198.51.100.1/32");
     }
 
     #[test]
